@@ -35,16 +35,20 @@ function clearString(str) {
  * Securely clears an object's properties
  * @param {object} obj - Object to clear
  */
-function clearObject(obj) {
+function clearObject(obj, seen = new WeakSet()) {
   if (obj && typeof obj === 'object') {
+    // Prevent infinite recursion on circular references
+    if (seen.has(obj)) return;
+    seen.add(obj);
+
     for (const key in obj) {
       if (typeof obj[key] === 'string') {
         clearString(obj[key]);
         obj[key] = '';
       } else if (Buffer.isBuffer(obj[key])) {
         zeroBuffer(obj[key]);
-      } else if (typeof obj[key] === 'object') {
-        clearObject(obj[key]);
+      } else if (typeof obj[key] === 'object' && obj[key] !== null) {
+        clearObject(obj[key], seen);
       }
     }
   }

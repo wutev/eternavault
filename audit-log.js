@@ -53,9 +53,29 @@ class AuditLog {
         this.encryptionKey
       );
 
-      return JSON.parse(decrypted);
+      // Parse and validate the decrypted data
+      // Note: encryption.decrypt() may auto-parse JSON, so check if already parsed
+      let parsed;
+      if (typeof decrypted === 'string') {
+        parsed = JSON.parse(decrypted);
+      } else {
+        parsed = decrypted;
+      }
+
+      if (!Array.isArray(parsed)) {
+        console.warn('[AUDIT] Log data is not an array, returning empty');
+        return [];
+      }
+      return parsed;
     } catch (err) {
-      console.error('[AUDIT] Failed to read log:', err.message);
+      // Distinguish between decryption and parsing errors for debugging
+      if (err.message.includes('Decryption failed')) {
+        console.error('[AUDIT] Failed to decrypt log - key may be wrong');
+      } else if (err instanceof SyntaxError) {
+        console.error('[AUDIT] Corrupted log data - invalid JSON');
+      } else {
+        console.error('[AUDIT] Failed to read log:', err.message);
+      }
       return [];
     }
   }
@@ -71,10 +91,23 @@ class AuditLog {
         return false;
       }
 
+      // Validate entries is an array
+      if (!Array.isArray(entries)) {
+        entries = [];
+      }
+
       // Limit to max entries
       if (entries.length > this.maxEntries) {
         entries = entries.slice(-this.maxEntries);
       }
+
+      // Age-based cleanup: remove entries older than 90 days
+      const MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
+      const cutoffTime = Date.now() - MAX_AGE_MS;
+      entries = entries.filter(entry => {
+        const entryTime = new Date(entry.timestamp).getTime();
+        return !isNaN(entryTime) && entryTime >= cutoffTime;
+      });
 
       const { encrypted, iv, tag } = encryption.encrypt(
         JSON.stringify(entries),
@@ -118,22 +151,27 @@ class AuditLog {
       };
 
       // Remove sensitive data from details before logging
-      if (entry.details.password) delete entry.details.password;
-      if (entry.details.masterPassword) delete entry.details.masterPassword;
+      if (entry.details && typeof entry.details === 'object') {
+        if (entry.details.password) delete entry.details.password;
+        if (entry.details.masterPassword) delete entry.details.masterPassword;
+      }
 
       entries.push(entry);
       this.write(entries);
 
-      // Also log to console for debugging
-      const severityPrefix = {
-        info: '[INFO]',
-        warning: '[WARN]',
-        critical: '[CRIT]'
-      }[severity] || '[LOG]';
-
-      console.log(`${severityPrefix} [AUDIT] ${event}:`, JSON.stringify(details));
+      // Only log event type to console (no sensitive details) in development
+      if (process.env.NODE_ENV === 'development') {
+        const severityPrefix = {
+          info: '[INFO]',
+          warning: '[WARN]',
+          critical: '[CRIT]'
+        }[severity] || '[LOG]';
+        // Only log event name, never details (could contain sensitive info)
+        console.log(`${severityPrefix} [AUDIT] ${event}`);
+      }
     } catch (err) {
-      console.error('[AUDIT] Failed to log event:', err.message);
+      // Don't log error details either - could leak sensitive information
+      console.error('[AUDIT] Failed to log event');
     }
   }
 
@@ -150,9 +188,11 @@ class AuditLog {
 
   /**
    * Logs vault lock
+   * @param {string} reason - Optional reason for lock
    */
-  logLock() {
+  logLock(reason = null) {
     this.log('vault.lock', {
+      reason,
       timestamp: Date.now()
     }, 'info');
   }

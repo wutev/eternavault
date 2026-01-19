@@ -1,6 +1,6 @@
 {
   "name": "eterna",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "A secure, offline-first personal vault for encrypted storage of journals, passwords, 2FA tokens, and sensitive files. Built with AES-256-GCM encryption and PBKDF2 key derivation.",
   "main": "main.js",
   "author": "Eterna",

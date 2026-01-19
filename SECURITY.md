@@ -17,7 +17,7 @@ EternaVault now implements **military-grade encryption** to protect all your sen
 ### 2. **PBKDF2 Key Derivation**
 - Master password is never stored or used directly for encryption
 - Cryptographic key is derived using PBKDF2-SHA256
-- **310,000 iterations** (Bitwarden standard)
+- **600,000 iterations** (2x Bitwarden standard)
 - Unique random 32-byte salt per vault
 - Protects against rainbow table and brute-force attacks
 
@@ -55,7 +55,7 @@ const result = await window.vault.initialize('MySecurePassword123!');
 
 // 2. System generates:
 //    - Random 32-byte salt
-//    - Derives encryption key using PBKDF2 (310,000 iterations)
+//    - Derives encryption key using PBKDF2 (600,000 iterations)
 //    - Creates empty encrypted vault
 //    - Stores salt and password hash (NOT the actual password)
 ```
@@ -214,7 +214,7 @@ await window.storage.delete(key);
 | Attack Vector | Protection |
 |---------------|------------|
 | File theft | AES-256-GCM encryption |
-| Brute force | PBKDF2 with 100k iterations |
+| Brute force | PBKDF2 with 600k iterations |
 | Rainbow tables | Unique random salt per vault |
 | XSS attacks | Content Security Policy |
 | IPC injection | Context isolation + validation |
@@ -246,7 +246,7 @@ await window.storage.delete(key);
 
 ### Key Derivation
 - **Algorithm**: PBKDF2-HMAC-SHA256
-- **Iterations**: 310,000 (Bitwarden standard)
+- **Iterations**: 600,000 (2x Bitwarden standard)
 - **Salt Size**: 256 bits (32 bytes) - randomly generated per vault
 - **Output Key Size**: 256 bits (32 bytes)
 
@@ -323,7 +323,7 @@ console.log('Match:', JSON.stringify(testData) === JSON.stringify(decrypted));
 - [x] Preload script with contextBridge
 - [x] CSP implemented
 - [x] AES-256-GCM encryption
-- [x] PBKDF2 key derivation (100k iterations)
+- [x] PBKDF2 key derivation (600k iterations)
 - [x] Random salt generation
 - [x] Session key in memory only
 - [x] Password strength validation

@@ -50,7 +50,7 @@ npm test
 ## Security
 
 - **Encryption:** AES-256-GCM (authenticated encryption)
-- **Key Derivation:** PBKDF2 with 310,000 iterations
+- **Key Derivation:** PBKDF2 with 600,000 iterations
 - **Process Isolation:** Context isolation enabled, no node in renderer
 - **Rate Limiting:** Brute-force protection on all authentication
 - **Audit Logging:** Encrypted security event tracking

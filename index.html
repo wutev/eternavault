@@ -147,7 +147,12 @@
       base32Chars: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567',
 
       base32Decode(str) {
-        str = str.toUpperCase().replace(/[^A-Z2-7]/g, '');
+        // Limit input length to prevent memory exhaustion (max 1024 chars = 640 bytes decoded)
+        const MAX_INPUT_LENGTH = 1024;
+        str = str.toUpperCase().replace(/[^A-Z2-7]/g, '').substring(0, MAX_INPUT_LENGTH);
+        if (str.length === 0) {
+          return new Uint8Array(0);
+        }
         let bits = '';
         for (const c of str) {
           const val = this.base32Chars.indexOf(c);
@@ -156,7 +161,7 @@
         }
         const bytes = [];
         for (let i = 0; i + 8 <= bits.length; i += 8) {
-          bytes.push(parseInt(bits.substr(i, 8), 2));
+          bytes.push(parseInt(bits.substring(i, i + 8), 2));
         }
         return new Uint8Array(bytes);
       },
@@ -180,15 +185,21 @@
           }
           const hmac = await this.hmacSha1(key, timeBytes);
           const offset = hmac[hmac.length - 1] & 0x0f;
-          const binary = ((hmac[offset] & 0x7f) << 24) |
+          // RFC 4226: ensure we have 4 bytes available from offset
+          if (offset + 4 > hmac.length) {
+            throw new Error('Invalid HMAC offset');
+          }
+          // Use >>> 0 to force unsigned 32-bit integer (RFC 4226 compliance)
+          const binary = (((hmac[offset] & 0x7f) << 24) |
                         ((hmac[offset + 1] & 0xff) << 16) |
                         ((hmac[offset + 2] & 0xff) << 8) |
-                        (hmac[offset + 3] & 0xff);
+                        (hmac[offset + 3] & 0xff)) >>> 0;
           const otp = binary % Math.pow(10, digits);
           return otp.toString().padStart(digits, '0');
         } catch (e) {
-          console.error('TOTP generation failed:', e);
-          return null;
+          // Return error indicator instead of silently failing
+          console.error('TOTP generation failed:', e.message);
+          return '------'; // Visual indicator of error
         }
       },
 
@@ -241,14 +252,21 @@
       },
 
       async scanFromCamera() {
-        return new Promise(async (resolve, reject) => {
-          try {
-            const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-            resolve({ stream, stop: () => stream.getTracks().forEach(t => t.stop()) });
-          } catch (e) {
-            reject(e);
-          }
-        });
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+          return {
+            stream,
+            stop: () => stream.getTracks().forEach(t => t.stop())
+          };
+        } catch (err) {
+          // Handle permission denied or no camera available
+          const message = err.name === 'NotAllowedError'
+            ? 'Camera permission denied'
+            : err.name === 'NotFoundError'
+              ? 'No camera found'
+              : 'Failed to access camera';
+          throw new Error(message);
+        }
       }
     };
 
@@ -453,6 +471,8 @@
       privateKey: '',
       failedAttempts: 0,
       lockoutUntil: 0,
+      permanentlyLocked: false,
+      lockoutLevel: null,
       undoStack: [],
       redoStack: [],
       isLoading: false,
@@ -463,11 +483,33 @@
       updateStatus: null,
       updateVersion: null,
       updatePercent: 0,
-      appVersion: '2.0.1'
+      appVersion: '2.0.2'
+    };
+
+    // ============ DOCUMENT LISTENER CLEANUP ============
+    // Track document-level event listeners to prevent memory leaks
+    const documentListeners = [];
+
+    const addDocumentListener = (event, handler, options) => {
+      document.addEventListener(event, handler, options);
+      documentListeners.push({ event, handler, options });
+    };
+
+    const cleanupDocumentListeners = () => {
+      while (documentListeners.length > 0) {
+        const { event, handler, options } = documentListeners.pop();
+        document.removeEventListener(event, handler, options);
+      }
     };
 
     // ============ UTILITIES ============
-    const generateId = () => Date.now().toString(36) + Math.random().toString(36).substr(2);
+    const generateId = () => {
+      // Use crypto for better randomness, fallback to Math.random
+      const randomPart = typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID().replace(/-/g, '').substring(0, 12)
+        : Math.random().toString(36).substring(2, 14).padEnd(12, '0');
+      return Date.now().toString(36) + randomPart;
+    };
 
     const generatePassword = (len, opts) => {
       let chars = '';
@@ -530,15 +572,21 @@
     const formatFullDate = (ts) => new Date(ts).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
 
     const formatBytes = (b) => {
-      if (!b) return '0 B';
-      const i = Math.floor(Math.log(b) / Math.log(1024));
-      return (b / Math.pow(1024, i)).toFixed(1) + ' ' + ['B', 'KB', 'MB', 'GB'][i];
+      // Ensure b is a valid positive number
+      const num = typeof b === 'number' ? b : parseFloat(b);
+      if (!Number.isFinite(num) || num < 0) return '0 B';
+      if (num === 0) return '0 B';
+      if (num < 1) return num.toFixed(2) + ' B'; // Handle fractional bytes
+      const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+      const i = Math.min(Math.floor(Math.log(num) / Math.log(1024)), units.length - 1);
+      return (num / Math.pow(1024, i)).toFixed(1) + ' ' + units[i];
     };
 
     const getFileType = (file) => {
       const type = file.type || '';
       const name = file.name || '';
-      const ext = name.split('.').pop().toLowerCase();
+      const parts = name.split('.');
+      const ext = parts.length > 1 ? parts.pop().toLowerCase() : '';
       if (type.startsWith('image/')) return 'image';
       if (type === 'application/pdf' || ext === 'pdf') return 'pdf';
       if (type.startsWith('video/')) return 'video';
@@ -693,6 +741,50 @@
       return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     };
 
+    // Debounce utility for performance optimization
+    const debounce = (fn, delay) => {
+      let timeoutId;
+      return (...args) => {
+        clearTimeout(timeoutId);
+        timeoutId = setTimeout(() => fn(...args), delay);
+      };
+    };
+
+    // Throttle utility for rate-limiting frequent calls
+    const throttle = (fn, limit) => {
+      let inThrottle;
+      return (...args) => {
+        if (!inThrottle) {
+          fn(...args);
+          inThrottle = true;
+          setTimeout(() => inThrottle = false, limit);
+        }
+      };
+    };
+
+    // Format duration in milliseconds to human-readable string
+    const formatDuration = (ms) => {
+      // Handle edge cases
+      if (!Number.isFinite(ms) || ms < 0) {
+        return 'permanently';
+      }
+
+      const seconds = Math.floor(ms / 1000);
+      const minutes = Math.floor(seconds / 60);
+      const hours = Math.floor(minutes / 60);
+      const days = Math.floor(hours / 24);
+
+      if (days > 0) {
+        return days === 1 ? '1 day' : `${days} days`;
+      } else if (hours > 0) {
+        return hours === 1 ? '1 hour' : `${hours} hours`;
+      } else if (minutes > 0) {
+        return minutes === 1 ? '1 minute' : `${minutes} minutes`;
+      } else {
+        return seconds === 1 ? '1 second' : `${seconds} seconds`;
+      }
+    };
+
     const getTheme = () => {
       const themeName = state.data?.settings?.theme || 'moonlight';
       return themes[themeName] || themes.moonlight;
@@ -751,7 +843,10 @@
         if (state.searchFilter === 'today') cutoff = now - day;
         else if (state.searchFilter === 'week') cutoff = now - (7 * day);
         else if (state.searchFilter === 'month') cutoff = now - (30 * day);
-        result = result.filter(i => (i.modified || i.created) >= cutoff);
+        result = result.filter(i => {
+          const timestamp = i.modified || i.created || 0;
+          return timestamp > 0 && timestamp >= cutoff;
+        });
       }
 
       // Apply sort order from settings
@@ -798,13 +893,41 @@
 
     // ============ SAVE / LOAD ============
     let saveTimeout = null;
+    let pendingSaveData = null; // Track data to save to prevent race condition
+
     const saveData = async () => {
       if (saveTimeout) clearTimeout(saveTimeout);
+
+      // Capture current state immediately to prevent race condition with vault lock
+      if (state.loaded && !state.locked) {
+        pendingSaveData = JSON.stringify(state.data);
+      }
+
       saveTimeout = setTimeout(async () => {
-        if (state.loaded && !state.locked) {
-          await window.storage.set(STORAGE_KEY, JSON.stringify(state.data));
+        if (pendingSaveData) {
+          try {
+            await window.storage.set(STORAGE_KEY, pendingSaveData);
+            pendingSaveData = null; // Only clear on success
+          } catch (err) {
+            console.error('Failed to save data:', err);
+            // Don't clear pendingSaveData on failure - will be retried on next save
+            showToast('Failed to save data. Will retry...', 'warning');
+          }
         }
       }, 300);
+    };
+
+    // Force immediate save (used before locking)
+    const saveDataImmediate = async () => {
+      if (saveTimeout) clearTimeout(saveTimeout);
+      if (state.loaded && !state.locked) {
+        try {
+          await window.storage.set(STORAGE_KEY, JSON.stringify(state.data));
+        } catch (err) {
+          console.error('Failed to save data:', err);
+        }
+      }
+      pendingSaveData = null;
     };
 
     // ============ RENDER HELPERS ============
@@ -831,11 +954,28 @@
         // Use backend vault.unlock
         const result = await window.vault.unlock(password);
 
+        // Handle permanent lock - vault must be reset
+        if (result.permanentlyLocked) {
+          state.permanentlyLocked = true;
+          state.lockoutLevel = result.lockoutLevel;
+          showToast('Vault permanently locked. Reset required.', 'error');
+          render();
+          return false;
+        }
+
         // Handle backend rate limiting
         if (result.locked) {
           const remaining = result.remainingSeconds || 0;
-          showToast(`Too many failed attempts. Try again in ${remaining}s`, 'error');
+          const lockoutLevel = result.lockoutLevel;
           state.lockoutUntil = Date.now() + (remaining * 1000);
+          state.lockoutLevel = lockoutLevel;
+
+          // Show warning about remaining lockouts
+          let message = result.error || `Too many failed attempts. Try again in ${formatDuration(remaining * 1000)}.`;
+          if (lockoutLevel && lockoutLevel.remainingLockouts <= 3) {
+            message += ` Warning: ${lockoutLevel.remainingLockouts} lockout(s) remaining before permanent lock!`;
+          }
+          showToast(message, 'error');
           render();
           return false;
         }
@@ -865,25 +1005,65 @@
           state.lastActivity = Date.now();
           state.failedAttempts = 0;
           state.lockoutUntil = 0;
+          state.permanentlyLocked = false;
+          state.lockoutLevel = null;
           render();
           startAutoLockTimer();
           startTotpTimer();
           return true;
         }
 
-        // Track failed attempts (frontend only)
-        state.failedAttempts++;
-        if (state.failedAttempts >= 5) {
-          // Exponential backoff: 30s, 60s, 120s, 240s...
-          const lockoutSeconds = 30 * Math.pow(2, Math.min(state.failedAttempts - 5, 4));
-          state.lockoutUntil = Date.now() + (lockoutSeconds * 1000);
-          showToast(`Too many failed attempts. Locked for ${lockoutSeconds}s`, 'error');
+        // Show error with lockout level info if available
+        if (result.lockoutLevel) {
+          state.lockoutLevel = result.lockoutLevel;
+          const { currentAttempts, maxAttempts, remainingLockouts } = result.lockoutLevel;
+          let message = result.error || 'Invalid master password';
+          if (remainingLockouts <= 5) {
+            message += ` (${maxAttempts - currentAttempts} attempts left, ${remainingLockouts} lockouts before permanent lock)`;
+          }
+          showToast(message, 'error');
         }
+
+        // Track failed attempts (frontend sync with backend)
+        state.failedAttempts++;
         return false;
       } finally {
         state.isLoading = false;
         state.loadingMessage = '';
         render();
+      }
+    };
+
+    /**
+     * Reload vault data from backend storage
+     * Used after import operations to sync frontend state
+     */
+    const loadData = async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY);
+        if (res?.success && res.value) {
+          const parsed = JSON.parse(res.value);
+          state.data = {
+            ...defaultData,
+            ...parsed,
+            totp: parsed.totp || [],
+            trash: parsed.trash || [],
+            fileLinks: parsed.fileLinks || [],
+            fileFolders: parsed.fileFolders || [],
+            settings: { ...defaultData.settings, ...(parsed.settings || {}) }
+          };
+          // Apply font size setting on load
+          if (state.data.settings?.fontSize) {
+            document.body.style.fontSize = state.data.settings.fontSize + 'px';
+          }
+          render();
+          return true;
+        }
+        return false;
+      } catch (err) {
+        console.error('Failed to load data:', err);
+        showToast('Failed to reload data', 'error');
+        return false;
       }
     };
 
@@ -927,6 +1107,9 @@
     };
 
     const lock = async () => {
+      // Save any pending data before locking to prevent data loss
+      await saveDataImmediate();
+
       // Lock backend vault (clears encryption key from memory)
       await window.vault.lock();
 
@@ -967,59 +1150,77 @@
     // ============ TOTP TIMER ============
     const startTotpTimer = () => {
       if (state.totpInterval) clearInterval(state.totpInterval);
+      // Only start timer if vault is unlocked
+      if (state.locked) return;
       updateAllTotpCodes();
       state.totpInterval = setInterval(updateAllTotpCodes, 1000);
     };
 
     const updateAllTotpCodes = async () => {
+      // Skip if not on TOTP section and no TOTP elements visible
       const totpItems = state.data.totp || [];
-      for (const item of totpItems) {
-        if (item.secret) {
-          const code = await TOTP.generate(item.secret);
-          state.totpCodes[item.id] = code;
+      if (totpItems.length === 0) return;
+
+      // Generate codes only when needed (every 30 seconds or on first load)
+      const remaining = TOTP.getTimeRemaining();
+      const shouldRegenerate = remaining === 30 || Object.keys(state.totpCodes).length === 0;
+
+      if (shouldRegenerate) {
+        for (const item of totpItems) {
+          if (item.secret) {
+            const code = await TOTP.generate(item.secret);
+            state.totpCodes[item.id] = code;
+          }
         }
       }
-      // Update TOTP display without full re-render
-      document.querySelectorAll('.totp-code-display').forEach(el => {
-        const id = el.dataset.id;
-        if (state.totpCodes[id]) {
-          el.textContent = state.totpCodes[id];
-        }
-      });
-      // Update linear timer bars (in list view)
-      document.querySelectorAll('.totp-timer').forEach(el => {
-        const remaining = TOTP.getTimeRemaining();
-        el.style.width = (remaining / 30 * 100) + '%';
-        el.style.background = remaining <= 5 ? getTheme().danger : getTheme().accent;
-      });
-      
-      // Update circular countdown (in detail view)
-      const remaining = TOTP.getTimeRemaining();
-      document.querySelectorAll('.totp-circle').forEach(el => {
-        const circumference = 163.36;
-        el.style.strokeDashoffset = circumference - (remaining / 30 * circumference);
-        el.style.stroke = remaining <= 5 ? getTheme().danger : getTheme().accent;
-      });
-      
-      // Update countdown number
-      document.querySelectorAll('.totp-countdown-container').forEach(container => {
-        const numEl = container.querySelector('div > div:last-child');
-        if (numEl) {
-          numEl.textContent = remaining;
-          numEl.style.color = remaining <= 5 ? getTheme().danger : getTheme().textMuted;
-        }
-      });
 
-      // Update remaining seconds text in detail view
-      document.querySelectorAll('.totp-remaining-text').forEach(el => {
-        el.textContent = remaining + 's';
-        el.style.color = remaining <= 5 ? getTheme().danger : getTheme().textMuted;
-      });
-
-      // Update TOTP code color when low
-      document.querySelectorAll('.totp-code-display').forEach(el => {
+      // Batch all DOM updates in a single requestAnimationFrame
+      requestAnimationFrame(() => {
+        // Cache theme lookup (only once per update)
         const theme = getTheme();
-        el.style.color = remaining <= 5 ? theme.danger : theme.accent;
+        const isLow = remaining <= 5;
+        const lowColor = theme.danger;
+        const normalColor = theme.accent;
+        const mutedColor = theme.textMuted;
+        const timerWidth = (remaining / 30 * 100) + '%';
+        const circumference = 163.36;
+        const strokeOffset = circumference - (remaining / 30 * circumference);
+
+        // Update TOTP code displays (text and color)
+        document.querySelectorAll('.totp-code-display').forEach(el => {
+          const id = el.dataset.id;
+          if (state.totpCodes[id]) {
+            el.textContent = state.totpCodes[id];
+          }
+          el.style.color = isLow ? lowColor : normalColor;
+        });
+
+        // Update linear timer bars
+        document.querySelectorAll('.totp-timer').forEach(el => {
+          el.style.width = timerWidth;
+          el.style.background = isLow ? lowColor : normalColor;
+        });
+
+        // Update circular countdown
+        document.querySelectorAll('.totp-circle').forEach(el => {
+          el.style.strokeDashoffset = strokeOffset;
+          el.style.stroke = isLow ? lowColor : normalColor;
+        });
+
+        // Update countdown text
+        document.querySelectorAll('.totp-countdown-container').forEach(container => {
+          const numEl = container.querySelector('div > div:last-child');
+          if (numEl) {
+            numEl.textContent = remaining;
+            numEl.style.color = isLow ? lowColor : mutedColor;
+          }
+        });
+
+        // Update remaining seconds text
+        document.querySelectorAll('.totp-remaining-text').forEach(el => {
+          el.textContent = remaining + 's';
+          el.style.color = isLow ? lowColor : mutedColor;
+        });
       });
     };
 
@@ -1189,8 +1390,14 @@
         const res = await window.storage.get(STORAGE_KEY);
         if (res?.success && res.value) {
           const parsed = JSON.parse(res.value);
-          // Merge backend data into state to get the real hash
-          state.data = { ...state.data, ...parsed };
+          // Deep merge backend data into state to get the real hash
+          // Only merge security-related fields from backend, preserve arrays from state
+          state.data = {
+            ...state.data,
+            privatePasswordHash: parsed.privatePasswordHash,
+            privatePasswordSalt: parsed.privatePasswordSalt,
+            privatePasswordIterations: parsed.privatePasswordIterations
+          };
         }
         state.privateLocked = false;
         state.privateKey = ''; // Don't store password in renderer
@@ -1291,7 +1498,7 @@
 
     const handleDragOver = (e, item) => {
       e.preventDefault();
-      if (!state.draggedItem || state.draggedItem.id === item.id) return;
+      if (!state.draggedItem || !item || state.draggedItem.id === item.id) return;
       state.dragOverItem = item;
       e.currentTarget.classList.add('drag-over');
     };
@@ -1307,15 +1514,19 @@
       if (!state.draggedItem || state.draggedItem.id === targetItem.id) return;
 
       const dataKey = state.section === 'journal' ? 'journal' : state.section === 'passwords' ? 'passwords' : state.section === 'totp' ? 'totp' : state.section === 'notes' ? 'notes' : 'files';
-      const items = [...state.data[dataKey]];
+      const sourceArray = state.data[dataKey];
+      if (!Array.isArray(sourceArray)) return;
+      const items = [...sourceArray];
       const draggedIndex = items.findIndex(i => i.id === state.draggedItem.id);
       const targetIndex = items.findIndex(i => i.id === targetItem.id);
 
       if (draggedIndex === -1 || targetIndex === -1) return;
 
       // Remove dragged item and insert at target position
+      // Adjust target index after splice if dragged item was before target
       const [removed] = items.splice(draggedIndex, 1);
-      items.splice(targetIndex, 0, removed);
+      const adjustedTargetIndex = draggedIndex < targetIndex ? targetIndex - 1 : targetIndex;
+      items.splice(adjustedTargetIndex, 0, removed);
 
       state.data[dataKey] = items;
       state.draggedItem = null;
@@ -1329,6 +1540,16 @@
 
     const getMaxFileSize = () => (state.data.settings?.maxFileSizeMB || 50) * 1024 * 1024;
     const getMaxVaultSize = () => (state.data.settings?.maxVaultSizeMB || 500) * 1024 * 1024;
+
+    // Helper to read file as Promise
+    const readFileAsDataURL = (file) => {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (ev) => resolve(ev.target.result);
+        reader.onerror = () => reject(new Error(`Failed to read "${file.name}"`));
+        reader.readAsDataURL(file);
+      });
+    };
 
     const processFiles = async (fileList, forJournal = false) => {
       const files = Array.from(fileList);
@@ -1353,73 +1574,72 @@
           continue;
         }
 
-        // Warn about potentially dangerous file types
-        const fileExt = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
-        if (DANGEROUS_FILE_TYPES.includes(fileExt)) {
-          showToast(`Warning: ${fileExt} files could be executable. Use caution.`, 'warning');
+        // Warn about potentially dangerous file types (check all extensions for double-extension attacks)
+        const dotIndex = file.name.lastIndexOf('.');
+        const fileExt = dotIndex !== -1 ? file.name.substring(dotIndex).toLowerCase() : '';
+        const allExtensions = file.name.toLowerCase().match(/\.[^.]+/g) || [];
+        const hasDangerousExt = allExtensions.some(ext => DANGEROUS_FILE_TYPES.includes(ext));
+        // Also warn if file has no extension (could be renamed executable)
+        if (hasDangerousExt) {
+          showToast(`Warning: ${file.name} contains executable extension. Use caution.`, 'warning');
+        } else if (dotIndex === -1 && file.size > 0) {
+          showToast(`Warning: ${file.name} has no extension. Verify file type before opening.`, 'warning');
         }
 
-        const reader = new FileReader();
-        reader.onload = async (ev) => {
-          try {
-            let fileData = ev.target.result;
+        try {
+          const fileData = await readFileAsDataURL(file);
 
-            if (forJournal && getSelected()) {
-              const image = { id: generateId(), name: file.name, data: fileData, created: Date.now() };
-              state.data.journal = state.data.journal.map(j =>
-                j.id === state.selectedId ? { ...j, images: [...(j.images || []), image] } : j
-              );
-            } else {
-              // Use backend encryption for files
-              let finalFileData = fileData;
-              let isEncrypted = false;
+          if (forJournal && getSelected()) {
+            const image = { id: generateId(), name: file.name, data: fileData, created: Date.now() };
+            state.data.journal = state.data.journal.map(j =>
+              j.id === state.selectedId ? { ...j, images: [...(j.images || []), image] } : j
+            );
+          } else {
+            // Use backend encryption for files
+            let finalFileData = fileData;
+            let isEncrypted = false;
 
-              if (state.data.settings?.encryptFiles) {
-                const result = await window.vault.encryptFile(fileData);
-                if (result.success) {
-                  finalFileData = result.encrypted;
-                  isEncrypted = true;
-                } else {
-                  showToast(`Failed to encrypt "${file.name}". File not added.`, 'error');
-                  console.error('File encryption failed:', result.error);
-                  return;
-                }
+            if (state.data.settings?.encryptFiles) {
+              const result = await window.vault.encryptFile(fileData);
+              if (result.success) {
+                finalFileData = result.encrypted;
+                isEncrypted = true;
+              } else {
+                showToast(`Failed to encrypt "${file.name}". File not added.`, 'error');
+                filesSkipped++;
+                continue;
               }
-
-              const item = {
-                id: generateId(),
-                name: file.name,
-                type: file.type,
-                size: file.size,
-                data: finalFileData,
-                encrypted: isEncrypted,
-                created: Date.now(),
-                folderId: state.selectedFolder || null
-              };
-              state.data.files = [item, ...state.data.files];
             }
-            filesProcessed++;
-            render();
-            saveData();
-          } catch (error) {
-            console.error('Error processing file:', error);
-            showToast(`Failed to process "${file.name}"`, 'error');
+
+            const item = {
+              id: generateId(),
+              name: file.name,
+              type: file.type,
+              size: file.size,
+              data: finalFileData,
+              encrypted: isEncrypted,
+              created: Date.now(),
+              folderId: state.selectedFolder || null
+            };
+            state.data.files = [item, ...state.data.files];
           }
-        };
-        reader.onerror = () => {
-          showToast(`Failed to read "${file.name}"`, 'error');
+          filesProcessed++;
+        } catch (error) {
+          console.error('Error processing file:', error);
+          showToast(`Failed to process "${file.name}"`, 'error');
           filesSkipped++;
-        };
-        reader.readAsDataURL(file);
+        }
+      }
+
+      // Save and render after all files processed
+      if (filesProcessed > 0) {
+        render();
+        saveData();
       }
 
       // Show summary if multiple files
-      if (files.length > 1) {
-        setTimeout(() => {
-          if (filesProcessed > 0) {
-            showToast(`Uploaded ${filesProcessed} file(s)${filesSkipped > 0 ? `, skipped ${filesSkipped}` : ''}`, 'success');
-          }
-        }, 500);
+      if (files.length > 1 && filesProcessed > 0) {
+        showToast(`Uploaded ${filesProcessed} file(s)${filesSkipped > 0 ? `, skipped ${filesSkipped}` : ''}`, 'success');
       }
     };
 
@@ -1435,10 +1655,19 @@
     };
 
     const downloadFile = async (file) => {
-      const a = document.createElement('a');
-      a.href = await getFileData(file);
-      a.download = file.name;
-      a.click();
+      try {
+        const fileData = await getFileData(file);
+        if (!fileData || fileData.length === 0) {
+          showToast('Failed to download file - could not decrypt or file is empty', 'error');
+          return;
+        }
+        const a = document.createElement('a');
+        a.href = fileData;
+        a.download = file.name;
+        a.click();
+      } catch (err) {
+        showToast('Failed to download file', 'error');
+      }
     };
 
     const restoreFromTrash = (id) => {
@@ -1472,20 +1701,51 @@
     };
 
     // ============ MISC ============
-    const copyText = (text) => {
-      navigator.clipboard.writeText(text);
+    let lastCopiedText = null;
+    let clipboardClearTimeout = null;
+    let clipboardCopyId = 0; // Unique ID to track copy operations and prevent race conditions
 
-      // Auto-clear clipboard after timeout if enabled
-      if (state.data.settings?.clearClipboard !== false) {
-        const timeout = state.data.settings?.clipboardTimeout || 30;
-        setTimeout(() => {
-          navigator.clipboard.readText().then(current => {
-            if (current === text) {
-              navigator.clipboard.writeText('');
+    const copyText = (text) => {
+      // Increment copy ID to track this specific copy operation
+      const currentCopyId = ++clipboardCopyId;
+
+      navigator.clipboard.writeText(text).then(() => {
+        lastCopiedText = text;
+
+        // Auto-clear clipboard after timeout if enabled
+        if (state.data.settings?.clearClipboard !== false) {
+          const timeout = state.data.settings?.clipboardTimeout || 30;
+
+          // Clear any existing timeout
+          if (clipboardClearTimeout) {
+            clearTimeout(clipboardClearTimeout);
+            clipboardClearTimeout = null;
+          }
+
+          clipboardClearTimeout = setTimeout(() => {
+            // Only clear if this is still the most recent copy operation
+            if (currentCopyId !== clipboardCopyId) {
+              return; // A newer copy has occurred, don't clear
             }
-          }).catch(() => {});
-        }, timeout * 1000);
-      }
+
+            // Try to read clipboard to verify, but clear anyway if we can't read
+            navigator.clipboard.readText().then(current => {
+              if (current === lastCopiedText) {
+                navigator.clipboard.writeText('').catch(() => {});
+              }
+              // Always clear lastCopiedText from memory regardless of clipboard state
+              lastCopiedText = null;
+            }).catch(() => {
+              // Can't read clipboard (permission denied) - clear it anyway for safety
+              navigator.clipboard.writeText('').catch(() => {});
+              lastCopiedText = null;
+            });
+            clipboardClearTimeout = null;
+          }, timeout * 1000);
+        }
+      }).catch(() => {
+        showToast('Failed to copy to clipboard', 'error');
+      });
     };
 
     const doGenerate = () => {
@@ -1515,13 +1775,13 @@
           filename = `eterna-backup-encrypted-${dateStr}.json`;
           type = 'application/json';
         } else {
-          // Unencrypted export
+          // Unencrypted export (export full backup wrapper for checksum verification)
           const result = await window.vault.exportBackup(null);
           if (!result.success) {
             showToast('Export failed', 'error');
             return;
           }
-          content = JSON.stringify(result.backup.data, null, 2);
+          content = JSON.stringify(result.backup, null, 2);
           filename = `eterna-backup-${dateStr}.json`;
           type = 'application/json';
         }
@@ -1559,16 +1819,49 @@
           // Check if encrypted backup
           if (parsed.encrypted && parsed.data) {
             state.showModal = 'importPassword';
-            state.modalData = { encryptedData: parsed.data, password: '' };
+            state.modalData = { backup: parsed, password: '' };  // Pass full backup object
             render();
             return;
           }
 
-          // Unencrypted backup
-          showConfirm('Import Data', 'This will replace all your current data with the imported data. Continue?', () => {
-            state.data = { ...defaultData, ...parsed, settings: { ...defaultData.settings, ...(parsed.settings || {}) } };
-            render();
-            saveData();
+          // Unencrypted backup - check if it's a backup wrapper or raw data
+          const isBackupWrapper = parsed.version && (parsed.encrypted === false || parsed.data);
+          showConfirm('Import Data', 'This will replace all your current data with the imported data. Continue?', async () => {
+            if (isBackupWrapper) {
+              // Use backend to import with checksum verification
+              const result = await window.vault.importBackup(parsed, null);
+              if (!result.success) {
+                showToast(result.error || 'Import failed', 'error');
+                return;
+              }
+              await loadData();
+            } else {
+              // Legacy raw data format - validate structure
+              if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+                showToast('Invalid backup format', 'error');
+                return;
+              }
+              // Ensure required arrays exist and are valid
+              const validatedData = {
+                ...defaultData,
+                ...parsed,
+                passwords: Array.isArray(parsed.passwords) ? parsed.passwords : [],
+                journal: Array.isArray(parsed.journal) ? parsed.journal : [],
+                totp: Array.isArray(parsed.totp) ? parsed.totp : [],
+                files: Array.isArray(parsed.files) ? parsed.files : [],
+                trash: Array.isArray(parsed.trash) ? parsed.trash : [],
+                notes: Array.isArray(parsed.notes) ? parsed.notes : [],
+                folders: Array.isArray(parsed.folders) ? parsed.folders : [],
+                passwordFolders: Array.isArray(parsed.passwordFolders) ? parsed.passwordFolders : [],
+                journalFolders: Array.isArray(parsed.journalFolders) ? parsed.journalFolders : [],
+                noteFolders: Array.isArray(parsed.noteFolders) ? parsed.noteFolders : [],
+                fileFolders: Array.isArray(parsed.fileFolders) ? parsed.fileFolders : [],
+                settings: { ...defaultData.settings, ...(parsed.settings || {}) }
+              };
+              state.data = validatedData;
+              render();
+              saveData();
+            }
             showToast('Data imported successfully', 'success');
           }, false);
         } catch (err) {
@@ -1578,20 +1871,19 @@
       reader.readAsText(file);
     };
 
-    const doImportEncrypted = async (encryptedData, password) => {
+    const doImportEncrypted = async (backup, password) => {
       try {
-        // Use backend decryption for import
-        const result = await window.vault.importBackup(encryptedData, password);
+        // Use backend decryption for import (pass full backup object with iv, tag, salt)
+        const result = await window.vault.importBackup(backup, password);
         if (!result.success) {
-          showToast('Incorrect password or corrupted backup', 'error');
+          showToast(result.error || 'Incorrect password or corrupted backup', 'error');
           return;
         }
 
-        const parsed = result.data;
-        state.data = { ...defaultData, ...parsed, settings: { ...defaultData.settings, ...(parsed.settings || {}) } };
         state.showModal = null;
         render();
-        saveData();
+        // Reload vault data from backend
+        await loadData();
         showToast('Encrypted backup imported successfully', 'success');
       } catch (err) {
         showToast('Decryption failed: ' + err.message, 'error');
@@ -1636,6 +1928,26 @@
       if (!state.data.settings) {
         state.data.settings = { ...defaultData.settings };
       }
+
+      // Validate numeric settings to prevent invalid values
+      const numericRanges = {
+        autoLockMinutes: { min: 1, max: 60 },
+        maxFileSizeMB: { min: 1, max: 500 },
+        maxVaultSizeMB: { min: 100, max: 5000 },
+        fontSize: { min: 10, max: 24 },
+        clipboardTimeout: { min: 5, max: 300 }
+      };
+
+      if (numericRanges[key]) {
+        const range = numericRanges[key];
+        const numValue = typeof value === 'number' ? value : parseInt(value, 10);
+        if (!Number.isFinite(numValue) || numValue < range.min || numValue > range.max) {
+          console.warn(`Invalid ${key} value: ${value}, using default`);
+          return; // Reject invalid value
+        }
+        value = numValue;
+      }
+
       state.data.settings = { ...state.data.settings, [key]: value };
       saveData();
 
@@ -1679,6 +1991,9 @@
         container = document.createElement('div');
         container.id = 'toastContainer';
         container.className = 'toast-container';
+        container.setAttribute('role', 'alert');
+        container.setAttribute('aria-live', 'polite');
+        container.setAttribute('aria-atomic', 'true');
         document.body.appendChild(container);
       }
       return container;
@@ -1690,7 +2005,7 @@
       toast.className = `toast ${type}`;
       toast.innerHTML = `
         <span class="toast-icon">${toastIcons[type] || toastIcons.info}</span>
-        <span class="toast-message">${message}</span>
+        <span class="toast-message">${escapeHtml(String(message))}</span>
         <span class="toast-close" onclick="this.parentElement.remove()">✕</span>
       `;
       container.appendChild(toast);
@@ -1741,7 +2056,7 @@
       const div = document.createElement('div');
       div.id = 'errorBanner';
       div.className = 'error-banner';
-      div.innerHTML = `<span style="margin-right: 8px;">!</span> ${message}`;
+      div.innerHTML = `<span style="margin-right: 8px;">!</span> ${escapeHtml(String(message))}`;
       document.body.appendChild(div);
 
       setTimeout(() => {
@@ -1785,10 +2100,12 @@
 
     const getFaviconHtml = (url, title) => {
       const faviconUrl = getFavicon(url);
+      // Safely get first character, defaulting to '?' if title is null/undefined/empty
+      const firstChar = (title && title.length > 0) ? title[0].toUpperCase() : '?';
       if (faviconUrl) {
-        return `<img src="${faviconUrl}" class="favicon" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';" /><div class="favicon-placeholder" style="display:none;">${(title || '?')[0].toUpperCase()}</div>`;
+        return `<img src="${faviconUrl}" class="favicon" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';" /><div class="favicon-placeholder" style="display:none;">${firstChar}</div>`;
       }
-      return `<div class="favicon-placeholder">${(title || '?')[0].toUpperCase()}</div>`;
+      return `<div class="favicon-placeholder">${firstChar}</div>`;
     };
 
     // ============ CONFIRMATION DIALOG ============
@@ -1929,7 +2246,7 @@
 
       div.querySelectorAll('.context-menu-item').forEach(el => {
         el.addEventListener('click', () => {
-          const idx = parseInt(el.dataset.action);
+          const idx = parseInt(el.dataset.action, 10);
           if (menuItems[idx]?.action) menuItems[idx].action();
           hideContextMenu();
         });
@@ -2033,7 +2350,18 @@
     };
 
     // ============ RENDER ============
-    const render = () => {
+    // Render batching with requestAnimationFrame to prevent multiple renders per frame
+    let renderPending = false;
+    const scheduleRender = () => {
+      if (renderPending) return;
+      renderPending = true;
+      requestAnimationFrame(() => {
+        renderPending = false;
+        doRender();
+      });
+    };
+
+    const doRender = () => {
       const app = document.getElementById('app');
       const theme = getTheme();
 
@@ -2098,9 +2426,74 @@
       }
     };
 
+    // Use scheduleRender as the default render function for batching
+    const render = scheduleRender;
+
     const renderLockScreen = (theme) => {
       const isLockedOut = state.lockoutUntil > Date.now();
-      const attemptsRemaining = Math.max(0, 5 - state.failedAttempts);
+      const isPermanentlyLocked = state.permanentlyLocked;
+      const lockoutLevel = state.lockoutLevel;
+      const attemptsRemaining = lockoutLevel
+        ? Math.max(0, lockoutLevel.maxAttempts - lockoutLevel.currentAttempts)
+        : Math.max(0, 5 - state.failedAttempts);
+      const lockoutsRemaining = lockoutLevel ? lockoutLevel.remainingLockouts : 10;
+
+      // Permanent lock UI
+      if (isPermanentlyLocked) {
+        return `
+        <div class="titlebar" style="position: fixed; top: 0; left: 0; right: 0; height: 40px; background: transparent; display: flex; justify-content: flex-end; align-items: center; padding-right: 8px; z-index: 100;">
+          <div class="window-controls" role="group" aria-label="Window controls">
+            <button id="minimizeBtn" class="window-control-btn minimize" aria-label="Minimize window" style="background: transparent;">
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="${theme.textMuted}" aria-hidden="true"><rect y="5" width="12" height="2"/></svg>
+            </button>
+            <button id="maximizeBtn" class="window-control-btn maximize" aria-label="Maximize window" style="background: transparent;">
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="${theme.textMuted}" stroke-width="1.5" aria-hidden="true"><rect x="1" y="1" width="10" height="10" rx="1"/></svg>
+            </button>
+            <button id="closeBtn" class="window-control-btn close" aria-label="Close window" style="background: transparent;">
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="${theme.textMuted}" aria-hidden="true"><path d="M1 1L11 11M11 1L1 11" stroke="${theme.textMuted}" stroke-width="1.5"/></svg>
+            </button>
+          </div>
+        </div>
+        <div style="min-height: 100vh; display: flex; align-items: center; justify-content: center;">
+          <div style="width: 420px; padding: 48px 40px; background: ${theme.surface}; border-radius: 16px; border: 1px solid ${theme.danger}40;">
+            <div style="text-align: center; margin-bottom: 36px;">
+              <div style="width: 64px; height: 64px; background: ${theme.danger}; border-radius: 16px; display: flex; align-items: center; justify-content: center; margin: 0 auto 20px;">
+                <span style="font-size: 32px;">🔐</span>
+              </div>
+              <div style="font-size: 24px; font-weight: 600; color: ${theme.danger}; margin-bottom: 8px;">
+                Vault Permanently Locked
+              </div>
+              <div style="font-size: 14px; color: ${theme.textMuted}; line-height: 1.5;">
+                Too many failed unlock attempts. For security, this vault has been permanently locked.
+              </div>
+            </div>
+            <div style="padding: 20px; background: ${theme.danger}10; border: 1px solid ${theme.danger}30; border-radius: 12px; margin-bottom: 24px;">
+              <div style="font-size: 13px; color: ${theme.text}; margin-bottom: 12px;">
+                <strong>What happened?</strong>
+              </div>
+              <div style="font-size: 12px; color: ${theme.textMuted}; line-height: 1.6;">
+                After ${lockoutLevel?.totalFailedAttempts || 'multiple'} failed password attempts across ${lockoutLevel?.maxLockouts || 10} lockout periods, the vault was permanently locked to protect your data from brute-force attacks.
+              </div>
+            </div>
+            <div style="padding: 20px; background: ${theme.warning}10; border: 1px solid ${theme.warning}30; border-radius: 12px; margin-bottom: 24px;">
+              <div style="font-size: 13px; color: ${theme.warning}; margin-bottom: 8px;">
+                <strong>Warning</strong>
+              </div>
+              <div style="font-size: 12px; color: ${theme.textMuted}; line-height: 1.6;">
+                Resetting the vault will permanently delete all stored data including passwords, notes, files, and 2FA codes. This action cannot be undone.
+              </div>
+            </div>
+            <button id="resetVaultBtn" style="width: 100%; padding: 14px; background: ${theme.danger}; border: none; border-radius: 8px; color: #fff; cursor: pointer; font-size: 14px; font-weight: 600;">
+              Reset Vault & Start Fresh
+            </button>
+            <div style="margin-top: 16px; text-align: center; font-size: 11px; color: ${theme.textFaint};">
+              If you remember your password, the data is still encrypted on disk.
+              <br/>Contact support for recovery options.
+            </div>
+          </div>
+        </div>
+        `;
+      }
 
       return `
       <div class="titlebar" style="position: fixed; top: 0; left: 0; right: 0; height: 40px; background: transparent; display: flex; justify-content: flex-end; align-items: center; padding-right: 8px; z-index: 100;">
@@ -2134,6 +2527,13 @@
               <div style="font-size: 32px; font-weight: 600; color: ${theme.danger}; margin-bottom: 4px;">--:--</div>
               <div style="font-size: 12px; color: ${theme.textMuted};">until unlock available</div>
             </div>
+            ${lockoutsRemaining <= 3 ? `
+              <div style="padding: 12px; background: ${theme.warning}15; border-radius: 8px; margin-bottom: 16px; text-align: center;">
+                <div style="font-size: 12px; color: ${theme.warning}; font-weight: 500;">
+                  Warning: ${lockoutsRemaining} lockout${lockoutsRemaining !== 1 ? 's' : ''} remaining before permanent lock
+                </div>
+              </div>
+            ` : ''}
           ` : `
             <div style="margin-bottom: 16px;">
               <input type="password" id="passInput" placeholder="Master password" autocomplete="current-password" style="width: 100%; padding: 11px 14px; background: ${theme.surfaceAlt}; border: 1px solid ${theme.border}; border-radius: 8px; color: ${theme.text}; font-size: 14px;" autofocus />
@@ -2150,6 +2550,7 @@
             ${!state.setupMode && state.failedAttempts > 0 ? `
               <div style="margin-top: 12px; text-align: center; font-size: 12px; color: ${attemptsRemaining <= 2 ? theme.danger : theme.textMuted};">
                 ${attemptsRemaining} attempt${attemptsRemaining !== 1 ? 's' : ''} remaining before lockout
+                ${lockoutsRemaining <= 5 ? `<br/><span style="color: ${theme.warning};">(${lockoutsRemaining} lockout${lockoutsRemaining !== 1 ? 's' : ''} until permanent lock)</span>` : ''}
               </div>
             ` : ''}
           `}
@@ -2244,7 +2645,7 @@
             `) : ''}
             ${state.section === 'totp' ? `
               <button id="newTotpBtn" style="flex: 1; padding: 9px 16px; background: ${theme.accent}; border: none; border-radius: 8px; color: #fff; cursor: pointer; font-size: 13px; font-weight: 500;">Add 2FA</button>
-              <button id="scanQrBtn" style="padding: 9px 16px; background: ${theme.elevated}; border: 1px solid ${theme.border}; border-radius: 8px; color: ${theme.text}; cursor: pointer; font-size: 13px; font-weight: 500;">Scan Scan</button>
+              <button id="scanQrBtn" style="padding: 9px 16px; background: ${theme.elevated}; border: 1px solid ${theme.border}; border-radius: 8px; color: ${theme.text}; cursor: pointer; font-size: 13px; font-weight: 500;">Scan QR</button>
             ` : ''}
             ${state.section === 'files' ? `
               <button id="uploadBtn" style="flex: 1; padding: 9px 16px; background: ${theme.accent}; border: none; border-radius: 8px; color: #fff; cursor: pointer; font-size: 13px; font-weight: 500;">Upload</button>
@@ -2253,7 +2654,7 @@
             ` : ''}
           </div>
           <div class="search-container" style="position: relative;">
-            <input type="text" id="searchInput" placeholder="Search..." value="${escapeHtml(state.search)}" style="width: 100%; padding: 11px 40px 11px 14px; background: ${theme.surfaceAlt}; border: 1px solid ${theme.border}; border-radius: 8px; color: ${theme.text}; font-size: 14px;" />
+            <input type="text" id="searchInput" placeholder="Search..." value="${escapeHtml(state.search)}" aria-label="Search vault items" style="width: 100%; padding: 11px 40px 11px 14px; background: ${theme.surfaceAlt}; border: 1px solid ${theme.border}; border-radius: 8px; color: ${theme.text}; font-size: 14px;" />
             <button id="searchFilterBtn" class="search-filter-btn" style="position: absolute; right: 8px; top: 50%; transform: translateY(-50%); padding: 4px 8px; background: ${state.searchFilter !== 'all' ? theme.accent : theme.surfaceAlt}; border: 1px solid ${state.searchFilter !== 'all' ? theme.accent : theme.border}; border-radius: 4px; font-size: 11px; cursor: pointer; color: ${state.searchFilter !== 'all' ? '#fff' : theme.textMuted};">
               ${state.searchFilter === 'all' ? '▼' : state.searchFilter.charAt(0).toUpperCase() + state.searchFilter.slice(1)}
             </button>
@@ -3017,7 +3418,7 @@
                   <span style="color: ${theme.accent};">&#10003;</span> AES-256-GCM Encryption
                 </div>
                 <div style="display: flex; align-items: center; gap: 8px; color: ${theme.textMuted};">
-                  <span style="color: ${theme.accent};">&#10003;</span> 310,000 PBKDF2 Iterations
+                  <span style="color: ${theme.accent};">&#10003;</span> 600,000 PBKDF2 Iterations
                 </div>
                 <div style="display: flex; align-items: center; gap: 8px; color: ${theme.textMuted};">
                   <span style="color: ${theme.accent};">&#10003;</span> TOTP Authenticator
@@ -3100,7 +3501,7 @@
     const renderModal = (theme) => {
       if (state.showModal === 'newFolder') {
         return `
-          <div class="modal-overlay" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
+          <div class="modal-overlay" role="dialog" aria-modal="true" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
             <div style="background: ${theme.surface}; padding: 24px; border-radius: 12px; min-width: 320px; border: 1px solid ${theme.border};">
               <div style="font-size: 18px; font-weight: 600; margin-bottom: 20px;">New Folder</div>
               <input type="text" id="folderNameInput" placeholder="Folder name" value="${escapeHtml(state.modalData.name || '')}" style="width: 100%; padding: 11px 14px; background: ${theme.surfaceAlt}; border: 1px solid ${theme.border}; border-radius: 8px; color: ${theme.text}; font-size: 14px; margin-bottom: 16px;" autofocus />
@@ -3114,7 +3515,7 @@
       }
       if (state.showModal === 'changePassword') {
         return `
-          <div class="modal-overlay" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
+          <div class="modal-overlay" role="dialog" aria-modal="true" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
             <div style="background: ${theme.surface}; padding: 24px; border-radius: 12px; min-width: 360px; border: 1px solid ${theme.border};">
               <div style="font-size: 18px; font-weight: 600; margin-bottom: 20px;">Change Master Password</div>
               <input type="password" id="currentPassInput" placeholder="Current password" autocomplete="current-password" style="width: 100%; padding: 11px 14px; background: ${theme.surfaceAlt}; border: 1px solid ${theme.border}; border-radius: 8px; color: ${theme.text}; font-size: 14px; margin-bottom: 12px;" autofocus />
@@ -3131,7 +3532,7 @@
       }
       if (state.showModal === 'exportVault') {
         return `
-          <div class="modal-overlay" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
+          <div class="modal-overlay" role="dialog" aria-modal="true" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
             <div style="background: ${theme.surface}; padding: 24px; border-radius: 12px; min-width: 380px; border: 1px solid ${theme.border};">
               <div style="font-size: 18px; font-weight: 600; margin-bottom: 8px;">Export Vault</div>
               <div style="font-size: 13px; color: ${theme.textMuted}; margin-bottom: 20px;">Create a backup of your vault data</div>
@@ -3159,7 +3560,7 @@
       }
       if (state.showModal === 'importPassword') {
         return `
-          <div class="modal-overlay" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
+          <div class="modal-overlay" role="dialog" aria-modal="true" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
             <div style="background: ${theme.surface}; padding: 24px; border-radius: 12px; min-width: 360px; border: 1px solid ${theme.border};">
               <div style="font-size: 18px; font-weight: 600; margin-bottom: 8px;">Encrypted Backup</div>
               <div style="font-size: 13px; color: ${theme.textMuted}; margin-bottom: 20px;">Enter the password used to encrypt this backup</div>
@@ -3180,7 +3581,7 @@
         };
         const entries = state.modalData?.entries || [];
         return `
-          <div class="modal-overlay" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
+          <div class="modal-overlay" role="dialog" aria-modal="true" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
             <div style="background: ${theme.surface}; padding: 24px; border-radius: 12px; min-width: 700px; max-width: 90vw; max-height: 80vh; border: 1px solid ${theme.border}; display: flex; flex-direction: column;">
               <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
                 <div>
@@ -3231,7 +3632,7 @@
     };
 
     const renderTemplatesModal = (theme) => `
-      <div class="modal-overlay" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
+      <div class="modal-overlay" role="dialog" aria-modal="true" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
         <div style="background: ${theme.surface}; padding: 24px; border-radius: 12px; min-width: 400px; border: 1px solid ${theme.border};">
           <div style="font-size: 18px; font-weight: 600; margin-bottom: 20px;">Choose Template</div>
           <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
@@ -3247,7 +3648,7 @@
     `;
 
     const renderVersionsModal = (theme, selected) => `
-      <div class="modal-overlay" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
+      <div class="modal-overlay" role="dialog" aria-modal="true" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
         <div style="background: ${theme.surface}; padding: 24px; border-radius: 12px; min-width: 400px; max-height: 80vh; overflow: auto; border: 1px solid ${theme.border};">
           <div style="font-size: 18px; font-weight: 600; margin-bottom: 20px;">Version History</div>
           ${selected.versions.length === 0 ? `<p style="color: ${theme.textMuted};">No previous versions</p>` : `
@@ -3269,7 +3670,7 @@
     `;
 
     const renderQrScannerModal = (theme) => `
-      <div class="modal-overlay" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
+      <div class="modal-overlay" role="dialog" aria-modal="true" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 200;">
         <div style="background: ${theme.surface}; padding: 24px; border-radius: 12px; min-width: 400px; border: 1px solid ${theme.border};">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
             <div style="font-size: 18px; font-weight: 600;">Add 2FA Account</div>
@@ -3362,12 +3763,49 @@
       document.getElementById('closeBtn')?.addEventListener('click', () => {
         window.windowControls?.close();
       });
+
+      // Reset vault button for permanent lock screen
+      document.getElementById('resetVaultBtn')?.addEventListener('click', async () => {
+        showConfirm(
+          'Reset Vault',
+          'This will permanently delete ALL your data including passwords, notes, files, and 2FA codes. This action CANNOT be undone. Are you absolutely sure?',
+          async () => {
+            try {
+              const result = await window.vault.reset();
+              if (result.success) {
+                // Clear frontend state
+                state.permanentlyLocked = false;
+                state.lockoutLevel = null;
+                state.failedAttempts = 0;
+                state.lockoutUntil = 0;
+                state.setupMode = true;
+                state.locked = true;
+                state.data = { ...defaultData };
+                render();
+                showToast('Vault reset successfully. Create a new password to start fresh.', 'success');
+              } else {
+                showToast('Failed to reset vault: ' + (result.error || 'Unknown error'), 'error');
+              }
+            } catch (err) {
+              console.error('Vault reset failed:', err);
+              showToast('Failed to reset vault', 'error');
+            }
+          },
+          'danger'
+        );
+      });
     };
 
     const attachMainAppEvents = () => {
+      // Clean up previous document-level listeners to prevent memory leaks
+      cleanupDocumentListeners();
+
       // Activity tracking
-      document.addEventListener('click', resetActivityTimer);
-      document.addEventListener('keydown', resetActivityTimer);
+      addDocumentListener('click', resetActivityTimer);
+      addDocumentListener('keydown', resetActivityTimer);
+
+      // Hide context menu on click (tracked to prevent accumulation)
+      addDocumentListener('click', contextMenuClickHandler);
 
       // Navigation
       document.querySelectorAll('.nav-btn').forEach(btn => {
@@ -3423,10 +3861,8 @@
         });
       }
 
-      // Search - no re-render, just filter
-      document.getElementById('searchInput')?.addEventListener('input', (e) => {
-        state.search = e.target.value;
-        // Only re-render the list
+      // Search - debounced to prevent lag on every keystroke
+      const debouncedSearch = debounce(() => {
         const listContainer = document.querySelector('[style*="overflow: auto"][style*="padding: 12px"]');
         if (listContainer) {
           const items = getSortedFiltered();
@@ -3436,6 +3872,11 @@
             : items.map(item => renderListItem(theme, item, getSelected())).join('');
           attachListItemEvents();
         }
+      }, 150); // 150ms debounce for responsive feel
+
+      document.getElementById('searchInput')?.addEventListener('input', (e) => {
+        state.search = e.target.value;
+        debouncedSearch();
       });
 
       attachListItemEvents();
@@ -3444,9 +3885,12 @@
       attachSettingsEvents();
     };
 
+    // Shared handler for context menu hiding (created once to avoid recreating on each call)
+    const contextMenuClickHandler = () => hideContextMenu();
+
     const attachListItemEvents = () => {
-      // Hide context menu on click
-      document.addEventListener('click', () => hideContextMenu());
+      // Hide context menu on click - use tracked listener (only added once in attachMainAppEvents)
+      // Don't add here since attachListItemEvents is called multiple times
 
       // List items with drag and drop and context menu
       document.querySelectorAll('.list-item').forEach(item => {
@@ -3578,7 +4022,7 @@
 
       // Password generator
       document.getElementById('genLenSlider')?.addEventListener('input', (e) => {
-        state.genLen = parseInt(e.target.value);
+        state.genLen = parseInt(e.target.value, 10);
         document.querySelector('[style*="min-width: 24px"]').textContent = state.genLen;
       });
 
@@ -3644,17 +4088,47 @@
         if (state.selectedId) removeItem(state.selectedId);
       });
 
-      // Journal
+      // Debounced content updates to prevent excessive saves and history spam
+      const debouncedContentUpdate = debounce((id, changes) => {
+        updateItem(id, changes);
+      }, 300);
+
+      // Debounced update for password fields
+      const debouncedPassFieldUpdate = debounce((id, key, value) => {
+        updateItem(id, { [key]: value });
+      }, 300);
+
+      // Debounced update for notes input
+      const debouncedNotesUpdate = debounce((id, value) => {
+        updateItem(id, { notes: value });
+      }, 300);
+
+      // Debounced update for TOTP fields
+      const debouncedTotpUpdate = debounce((id, changes) => {
+        updateItem(id, changes);
+      }, 300);
+
+      // Debounced update for note items
+      const debouncedNoteItemUpdate = debounce((id, changes) => {
+        updateItem(id, changes);
+      }, 300);
+
       document.querySelectorAll('.edit-mode-btn').forEach(btn => {
         btn.addEventListener('click', () => { state.editMode = btn.dataset.mode; render(); });
       });
 
       document.getElementById('titleInput')?.addEventListener('input', (e) => {
-        updateItem(state.selectedId, { title: e.target.value });
+        // Immediate local update for responsive feel, debounced save
+        const item = getItems().find(i => i.id === state.selectedId);
+        if (item) item.title = e.target.value;
+        debouncedContentUpdate(state.selectedId, { title: e.target.value });
       });
 
       document.getElementById('contentInput')?.addEventListener('input', (e) => {
-        updateItem(state.selectedId, { content: e.target.value });
+        // Immediate local update for responsive feel, debounced save
+        const item = getItems().find(i => i.id === state.selectedId);
+        if (item) item.content = e.target.value;
+        debouncedContentUpdate(state.selectedId, { content: e.target.value });
       });
 
       document.getElementById('pinBtn')?.addEventListener('click', () => {
@@ -3681,15 +4155,15 @@
         });
       });
 
-      // Passwords
+      // Passwords - debounced to prevent excessive saves
       document.querySelectorAll('.pass-field').forEach(input => {
         input.addEventListener('input', () => {
-          updateItem(state.selectedId, { [input.dataset.key]: input.value });
+          debouncedPassFieldUpdate(state.selectedId, input.dataset.key, input.value);
         });
       });
 
       document.getElementById('notesInput')?.addEventListener('input', (e) => {
-        updateItem(state.selectedId, { notes: e.target.value });
+        debouncedNotesUpdate(state.selectedId, e.target.value);
       });
 
       document.querySelectorAll('.toggle-pass-btn').forEach(btn => {
@@ -3723,19 +4197,19 @@
         }
       });
 
-      // TOTP
+      // TOTP - debounced saves
       document.getElementById('totpIssuer')?.addEventListener('input', (e) => {
-        updateItem(state.selectedId, { issuer: e.target.value });
+        debouncedTotpUpdate(state.selectedId, { issuer: e.target.value });
       });
 
       document.getElementById('totpAccount')?.addEventListener('input', (e) => {
-        updateItem(state.selectedId, { account: e.target.value });
+        debouncedTotpUpdate(state.selectedId, { account: e.target.value });
       });
 
       document.getElementById('totpSecret')?.addEventListener('input', async (e) => {
         const secret = e.target.value.toUpperCase().replace(/[^A-Z2-7]/g, '');
-        updateItem(state.selectedId, { secret });
-        // Generate code immediately
+        debouncedTotpUpdate(state.selectedId, { secret });
+        // Generate code immediately for feedback
         if (secret.length >= 16) {
           const code = await TOTP.generate(secret);
           if (code) {
@@ -3753,13 +4227,13 @@
         }
       });
 
-      // Notes
+      // Notes - debounced saves
       document.getElementById('noteTitleInput')?.addEventListener('input', (e) => {
-        updateItem(state.selectedId, { title: e.target.value });
+        debouncedNoteItemUpdate(state.selectedId, { title: e.target.value });
       });
 
       document.getElementById('noteContentInput')?.addEventListener('input', (e) => {
-        updateItem(state.selectedId, { content: e.target.value });
+        debouncedNoteItemUpdate(state.selectedId, { content: e.target.value });
       });
 
       document.getElementById('pinNoteBtn')?.addEventListener('click', () => {
@@ -3865,13 +4339,21 @@
       document.querySelectorAll('.restore-version-btn').forEach(btn => {
         btn.addEventListener('click', () => {
           const selected = getSelected();
-          if (selected?.versions) {
-            const version = selected.versions[parseInt(btn.dataset.index)];
-            if (version) {
-              updateItem(selected.id, { content: version.content, title: version.title });
-              state.showVersions = false;
-              render();
-            }
+          const index = parseInt(btn.dataset.index, 10);
+
+          if (!selected?.versions || isNaN(index) || index < 0 || index >= selected.versions.length) {
+            showToast('Failed to restore version - invalid selection', 'error');
+            return;
+          }
+
+          const version = selected.versions[index];
+          if (version) {
+            updateItem(selected.id, { content: version.content, title: version.title });
+            state.showVersions = false;
+            render();
+            showToast('Version restored', 'success');
+          } else {
+            showToast('Failed to restore version', 'error');
           }
         });
       });
@@ -3910,18 +4392,23 @@
           showToast('Please enter the backup password', 'error');
           return;
         }
-        doImportEncrypted(state.modalData.encryptedData, pass);
+        doImportEncrypted(state.modalData.backup, pass);
       });
 
       document.getElementById('importPassInput')?.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
           const pass = e.target.value;
-          if (pass) doImportEncrypted(state.modalData.encryptedData, pass);
+          if (pass) doImportEncrypted(state.modalData.backup, pass);
         }
       });
     };
 
     const attachSettingsEvents = () => {
+      // Debounced settings update for sliders
+      const debouncedFontSizeUpdate = debounce((value) => {
+        updateSettings('fontSize', value);
+      }, 150);
+
       document.querySelectorAll('.theme-btn').forEach(btn => {
         btn.addEventListener('click', () => {
           updateSettings('theme', btn.dataset.theme);
@@ -3930,19 +4417,25 @@
       });
 
       document.getElementById('autoLockSelect')?.addEventListener('change', (e) => {
-        const val = parseInt(e.target.value);
+        const val = parseInt(e.target.value, 10);
         updateSettings('autoLockMinutes', val);
         showToast(val === 0 ? 'Auto-lock disabled' : `Auto-lock set to ${val} minute${val > 1 ? 's' : ''}`, 'success');
       });
 
       document.getElementById('maxAttemptsSelect')?.addEventListener('change', (e) => {
-        const val = parseInt(e.target.value);
+        const val = parseInt(e.target.value, 10);
         updateSettings('maxLoginAttempts', val);
         showToast(`Max login attempts set to ${val}`, 'success');
       });
 
       document.getElementById('fontSizeSlider')?.addEventListener('input', (e) => {
-        updateSettings('fontSize', parseInt(e.target.value));
+        const value = parseInt(e.target.value, 10);
+        // Apply font size immediately for responsive feel
+        document.body.style.fontSize = value + 'px';
+        const display = e.target.parentElement?.querySelector('span:last-child');
+        if (display) display.textContent = value + 'px';
+        // Debounce the save
+        debouncedFontSizeUpdate(value);
       });
 
       document.getElementById('fontSizeSlider')?.addEventListener('change', (e) => {
@@ -3967,12 +4460,12 @@
       });
 
       document.getElementById('maxFileSizeSelect')?.addEventListener('change', (e) => {
-        updateSettings('maxFileSizeMB', parseInt(e.target.value));
+        updateSettings('maxFileSizeMB', parseInt(e.target.value, 10));
         showToast(`Max file size set to ${e.target.value} MB`, 'success');
       });
 
       document.getElementById('maxVaultSizeSelect')?.addEventListener('change', (e) => {
-        const value = parseInt(e.target.value);
+        const value = parseInt(e.target.value, 10);
         updateSettings('maxVaultSizeMB', value);
         showToast(`Max vault size set to ${value >= 1000 ? (value / 1000) + ' GB' : value + ' MB'}`, 'success');
       });
@@ -4127,6 +4620,20 @@
           return;
         }
 
+        // Check lockout status from backend
+        try {
+          const lockoutStatus = await window.vault.getLockoutStatus();
+          if (lockoutStatus.isPermanentlyLocked) {
+            state.permanentlyLocked = true;
+            state.lockoutLevel = lockoutStatus.lockoutLevel;
+          } else if (lockoutStatus.isLocked) {
+            state.lockoutUntil = Date.now() + (lockoutStatus.remainingSeconds * 1000);
+            state.lockoutLevel = lockoutStatus.lockoutLevel;
+          }
+        } catch (lockoutErr) {
+          console.warn('Could not check lockout status:', lockoutErr);
+        }
+
         // Vault exists but is locked - show unlock screen
         state.setupMode = false;
         state.locked = true;
@@ -4165,7 +4672,7 @@
     // ============ TRAY LOCK HANDLER ============
     window.windowControls?.onLockVault?.(async () => {
       if (!state.locked) {
-        await lock();
+        await lock().catch(console.error);
       }
     });
 
@@ -4230,7 +4737,7 @@
           e.preventDefault();
           if (state.locked) return;
           const sections = ['journal', 'notes', 'passwords', 'totp', 'files', 'settings'];
-          const index = parseInt(e.key) - 1;
+          const index = parseInt(e.key, 10) - 1;
           if (sections[index]) {
             state.section = sections[index];
             state.selectedId = null;

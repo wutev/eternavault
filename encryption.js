@@ -10,15 +10,16 @@ const KEY_LENGTH = 32; // 256 bits
 const IV_LENGTH = 16; // 128 bits
 const SALT_LENGTH = 32;
 const TAG_LENGTH = 16; // eslint-disable-line no-unused-vars -- kept for documentation
-const PBKDF2_ITERATIONS = 310000; // Bitwarden standard, ~3x OWASP minimum
+const PBKDF2_ITERATIONS = 600000; // 2x Bitwarden standard, ~6x OWASP minimum for stronger protection
 
 /**
  * Derives a cryptographic key from a master password using PBKDF2
  * @param {string} masterPassword - The user's master password
  * @param {Buffer} salt - Salt for key derivation (generate if not provided)
- * @returns {Object} { key: Buffer, salt: Buffer }
+ * @param {number} iterations - Number of PBKDF2 iterations (for backward compatibility with old vaults)
+ * @returns {Object} { key: Buffer, salt: Buffer, iterations: number }
  */
-function deriveKey(masterPassword, salt = null) {
+function deriveKey(masterPassword, salt = null, iterations = null) {
   // Accept any password - no validation
   if (!masterPassword) {
     throw new Error('Master password required');
@@ -29,16 +30,19 @@ function deriveKey(masterPassword, salt = null) {
     salt = crypto.randomBytes(SALT_LENGTH);
   }
 
+  // Use provided iterations or default to current standard
+  const iterCount = iterations || PBKDF2_ITERATIONS;
+
   // Derive key using PBKDF2 with SHA-256
   const key = crypto.pbkdf2Sync(
     masterPassword,
     salt,
-    PBKDF2_ITERATIONS,
+    iterCount,
     KEY_LENGTH,
     'sha256'
   );
 
-  return { key, salt };
+  return { key, salt, iterations: iterCount };
 }
 
 /**
@@ -52,8 +56,16 @@ function encrypt(data, key) {
     throw new Error('Invalid encryption key');
   }
 
+  // Validate data is not null/undefined
+  if (data === null || data === undefined) {
+    throw new Error('Cannot encrypt null or undefined data');
+  }
+
   // Convert data to JSON string if it's an object
   const plaintext = typeof data === 'string' ? data : JSON.stringify(data);
+
+  // Check for empty data (could indicate accidental data loss)
+  // Note: Empty data is allowed but unusual - caller should validate if needed
 
   // Generate random IV
   const iv = crypto.randomBytes(IV_LENGTH);
@@ -86,6 +98,21 @@ function encrypt(data, key) {
 function decrypt(encryptedData, ivHex, tagHex, key) {
   if (!key || key.length !== KEY_LENGTH) {
     throw new Error('Invalid decryption key');
+  }
+
+  // Validate IV hex format (must be 32 hex chars = 16 bytes)
+  if (!ivHex || !/^[0-9a-f]{32}$/i.test(ivHex)) {
+    throw new Error('Invalid IV format');
+  }
+
+  // Validate tag hex format (must be 32 hex chars = 16 bytes)
+  if (!tagHex || !/^[0-9a-f]{32}$/i.test(tagHex)) {
+    throw new Error('Invalid authentication tag format');
+  }
+
+  // Validate encrypted data is valid hex
+  if (!encryptedData || !/^[0-9a-f]+$/i.test(encryptedData)) {
+    throw new Error('Invalid encrypted data format');
   }
 
   try {
@@ -147,8 +174,10 @@ function encryptVault(vaultData, masterPassword) {
  */
 function decryptVault(encryptedVault, saltHex, masterPassword) {
   // Derive key from master password and stored salt
+  // Use stored iterations for backward compatibility with older vaults
   const salt = Buffer.from(saltHex, 'hex');
-  const { key } = deriveKey(masterPassword, salt);
+  const storedIterations = encryptedVault.iterations ?? PBKDF2_ITERATIONS;
+  const { key } = deriveKey(masterPassword, salt, storedIterations);
 
   // Decrypt the vault
   const decrypted = decrypt(
@@ -186,11 +215,30 @@ function generateSecurePassword(length = 32, options = {}) {
   }
 
   let password = '';
-  const randomBytes = crypto.randomBytes(length);
+  const charsetLength = charset.length;
 
-  for (let i = 0; i < length; i++) {
-    const randomIndex = randomBytes[i] % charset.length;
-    password += charset[randomIndex];
+  // Use rejection sampling to avoid modulo bias
+  // Calculate the largest multiple of charsetLength that fits in a byte
+  const maxValidValue = Math.floor(256 / charsetLength) * charsetLength;
+
+  let i = 0;
+  while (password.length < length) {
+    // Generate more random bytes if needed
+    const randomBytes = crypto.randomBytes(Math.max(length - password.length, 32));
+
+    for (let j = 0; j < randomBytes.length && password.length < length; j++) {
+      const randomValue = randomBytes[j];
+      // Reject values that would cause bias
+      if (randomValue < maxValidValue) {
+        password += charset[randomValue % charsetLength];
+      }
+    }
+    i++;
+    // Safety limit to prevent infinite loop (extremely unlikely)
+    if (i > 100) {
+      // If we hit the limit, throw error instead of returning short password
+      throw new Error('Password generation failed - unable to generate enough random bytes');
+    }
   }
 
   return password;
@@ -249,26 +297,41 @@ function validatePasswordStrength(password) {
 }
 
 /**
- * Hash a password for verification using PBKDF2 (not for encryption)
- * Uses fewer iterations than key derivation for faster verification
+ * Hash a password for verification using PBKDF2
+ * Uses same iterations as key derivation for consistent security
  * @param {string} password - Password to hash
  * @param {Buffer|string} salt - Salt for hashing (required for security)
+ * @param {number} iterations - Optional iterations override for backward compatibility
  * @returns {string} Hex-encoded hash
  */
-function hashPassword(password, salt) {
+function hashPassword(password, salt, iterations = null) {
   if (!salt) {
     throw new Error('Salt is required for secure password hashing');
   }
 
-  // Convert salt to Buffer if it's a hex string
-  const saltBuffer = typeof salt === 'string' ? Buffer.from(salt, 'hex') : salt;
+  // Convert salt to Buffer if it's a hex string, with validation
+  let saltBuffer;
+  if (typeof salt === 'string') {
+    // Validate hex format (must be 64 hex chars = 32 bytes)
+    if (!/^[0-9a-f]{64}$/i.test(salt)) {
+      throw new Error('Invalid salt format: must be 64 hex characters');
+    }
+    saltBuffer = Buffer.from(salt, 'hex');
+  } else if (Buffer.isBuffer(salt)) {
+    if (salt.length !== SALT_LENGTH) {
+      throw new Error(`Invalid salt length: expected ${SALT_LENGTH} bytes`);
+    }
+    saltBuffer = salt;
+  } else {
+    throw new Error('Salt must be a hex string or Buffer');
+  }
 
-  // Use PBKDF2 with 100,000 iterations for password verification
-  // Fewer than key derivation but still computationally expensive
+  // Use same iterations as key derivation for consistent security
+  const iterCount = iterations || PBKDF2_ITERATIONS;
   const hash = crypto.pbkdf2Sync(
     password,
     saltBuffer,
-    100000,
+    iterCount,
     32,
     'sha256'
   );

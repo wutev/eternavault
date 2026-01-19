@@ -12,10 +12,16 @@ contextBridge.exposeInMainWorld('windowControls', {
   close: () => ipcRenderer.invoke('window:close'),
   isMaximized: () => ipcRenderer.invoke('window:isMaximized'),
   onMaximizeChange: (callback) => {
-    ipcRenderer.on('window-maximized', (event, isMaximized) => callback(isMaximized));
+    const handler = (event, isMaximized) => callback(isMaximized);
+    ipcRenderer.on('window-maximized', handler);
+    // Return cleanup function to prevent memory leaks
+    return () => ipcRenderer.removeListener('window-maximized', handler);
   },
   onLockVault: (callback) => {
-    ipcRenderer.on('lock-vault', () => callback());
+    const handler = () => callback();
+    ipcRenderer.on('lock-vault', handler);
+    // Return cleanup function to prevent memory leaks
+    return () => ipcRenderer.removeListener('lock-vault', handler);
   }
 });
 
@@ -30,7 +36,10 @@ contextBridge.exposeInMainWorld('autoUpdater', {
   downloadUpdate: () => ipcRenderer.invoke('update:download'),
   installUpdate: () => ipcRenderer.invoke('update:install'),
   onUpdateStatus: (callback) => {
-    ipcRenderer.on('update-status', (event, data) => callback(data));
+    const handler = (event, data) => callback(data);
+    ipcRenderer.on('update-status', handler);
+    // Return cleanup function to prevent memory leaks
+    return () => ipcRenderer.removeListener('update-status', handler);
   }
 });
 
@@ -41,6 +50,7 @@ contextBridge.exposeInMainWorld('vault', {
   unlock: (masterPassword) => ipcRenderer.invoke('vault:unlock', masterPassword),
   lock: () => ipcRenderer.invoke('vault:lock'),
   isUnlocked: () => ipcRenderer.invoke('vault:isUnlocked'),
+  getLockoutStatus: () => ipcRenderer.invoke('vault:getLockoutStatus'),
 
   // Master password management
   changeMasterPassword: (currentPassword, newPassword) =>

@@ -41,16 +41,103 @@ if (!gotTheLock) {
 autoUpdater.autoDownload = false;
 autoUpdater.autoInstallOnAppQuit = true;
 
+// ============ CONFIGURATION CONSTANTS ============
+const CONFIG = {
+  // Lockout settings
+  LOCKOUT_MAX_ATTEMPTS: 5,           // Attempts before lockout triggers
+  LOCKOUT_TIMEOUTS: [                // Progressive timeout durations in ms
+    30 * 1000,                       // 30 seconds
+    60 * 1000,                       // 1 minute
+    2 * 60 * 1000,                   // 2 minutes
+    5 * 60 * 1000,                   // 5 minutes
+    15 * 60 * 1000,                  // 15 minutes
+    30 * 60 * 1000,                  // 30 minutes
+    60 * 60 * 1000,                  // 1 hour
+    2 * 60 * 60 * 1000,              // 2 hours
+    6 * 60 * 60 * 1000,              // 6 hours
+    24 * 60 * 60 * 1000              // 24 hours
+  ],
+  LOCKOUT_MAX_LOCKOUTS: 10,          // After this many lockouts, permanent lock
+
+  // Rate limiting
+  ENCRYPTION_RATE_LIMIT: 100,        // Operations per minute
+  STORAGE_RATE_LIMIT: 1000,          // Operations per minute
+  PASSWORD_CHANGE_RATE_LIMIT: 5,     // Per 5 minutes
+  PRIVATE_UNLOCK_RATE_LIMIT: 5,      // Per 5 minutes
+
+  // Session
+  SESSION_TIMEOUT_MS: 30 * 60 * 1000, // 30 minutes
+
+  // Backup
+  MAX_BACKUP_SIZE: 500 * 1024 * 1024, // 500 MB
+
+  // Password limits (prevent DoS via huge passwords causing PBKDF2 slowdown)
+  MAX_PASSWORD_LENGTH: 1024          // 1KB max password length
+};
+
 const dataPath = path.join(app.getPath('userData'), 'vault-data.json');
 const configPath = path.join(app.getPath('userData'), 'vault-config.json');
 const auditLogPath = path.join(app.getPath('userData'), 'audit-log.json');
+const lockoutStatePath = path.join(app.getPath('userData'), 'lockout-state.json');
 
 // Session storage (in-memory, cleared on app restart)
 const secureSessionKey = new SecureSessionKey(); // Secure session key manager
 let isVaultUnlocked = false;
 
+/**
+ * Check if session key needs rotation (auto-lock for security)
+ * @returns {boolean} True if vault should be locked
+ */
+function checkSessionKeyRotation() {
+  if (isVaultUnlocked && secureSessionKey.exists() && secureSessionKey.needsRotation()) {
+    // Auto-lock vault for security - user must re-authenticate
+    auditLog.logLock('Session timeout - key rotation required');
+    auditLog.clearEncryptionKey();
+    secureSessionKey.clear();
+    isVaultUnlocked = false;
+    // Notify renderer to show lock screen
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('lock-vault');
+    }
+    return true;
+  }
+  return false;
+}
+
 // Audit logging
 const auditLog = new AuditLog(auditLogPath);
+
+// Pending audit events queue (for events that occur before vault unlock)
+const pendingAuditEvents = [];
+
+/**
+ * Queue an audit event for logging after vault unlock
+ * @param {string} event - Event type
+ * @param {object} details - Event details
+ * @param {string} severity - Event severity
+ */
+function queueAuditEvent(event, details = {}, severity = 'info') {
+  pendingAuditEvents.push({
+    event,
+    details: { ...details, queuedAt: Date.now() },
+    severity,
+    timestamp: new Date().toISOString()
+  });
+  // Limit queue size to prevent memory issues
+  if (pendingAuditEvents.length > 100) {
+    pendingAuditEvents.shift();
+  }
+}
+
+/**
+ * Flush pending audit events to the log (call after unlock)
+ */
+function flushPendingAuditEvents() {
+  while (pendingAuditEvents.length > 0) {
+    const event = pendingAuditEvents.shift();
+    auditLog.log(event.event, { ...event.details, originalTimestamp: event.timestamp }, event.severity);
+  }
+}
 
 // Rate limiting for IPC handlers
 class RateLimiter {
@@ -58,14 +145,24 @@ class RateLimiter {
     this.maxAttempts = maxAttempts;
     this.windowMs = windowMs;
     this.attempts = new Map(); // key -> { count, resetTime }
+    this.lastCleanup = Date.now();
+    this.cleanupInterval = 60000; // Cleanup every minute
   }
 
   tryAcquire(key) {
     const now = Date.now();
+
+    // Periodically cleanup expired entries to prevent memory leak
+    if (now - this.lastCleanup > this.cleanupInterval) {
+      this.cleanup();
+      this.lastCleanup = now;
+    }
+
     const record = this.attempts.get(key);
 
     if (!record || now > record.resetTime) {
-      // New window
+      // New window - delete old record first to allow GC
+      this.attempts.delete(key);
       this.attempts.set(key, { count: 1, resetTime: now + this.windowMs });
       return { allowed: true };
     }
@@ -87,50 +184,246 @@ class RateLimiter {
   reset(key) {
     this.attempts.delete(key);
   }
+
+  /**
+   * Clean up expired rate limit entries to prevent memory leak
+   */
+  cleanup() {
+    const now = Date.now();
+    for (const [key, record] of this.attempts.entries()) {
+      if (now > record.resetTime) {
+        this.attempts.delete(key);
+      }
+    }
+  }
 }
 
-// Rate limiters for different operations
-const encryptionRateLimiter = new RateLimiter(100, 60000); // 100 per minute
-const storageRateLimiter = new RateLimiter(1000, 60000); // 1000 per minute
-const passwordChangeRateLimiter = new RateLimiter(5, 300000); // 5 per 5 minutes
-const privateUnlockRateLimiter = new RateLimiter(5, 300000); // 5 per 5 minutes
+// Rate limiters for different operations (using CONFIG values)
+const encryptionRateLimiter = new RateLimiter(CONFIG.ENCRYPTION_RATE_LIMIT, 60000);
+const storageRateLimiter = new RateLimiter(CONFIG.STORAGE_RATE_LIMIT, 60000);
+const passwordChangeRateLimiter = new RateLimiter(CONFIG.PASSWORD_CHANGE_RATE_LIMIT, 300000);
+const privateUnlockRateLimiter = new RateLimiter(CONFIG.PRIVATE_UNLOCK_RATE_LIMIT, 300000);
 
-// Rate limiting for sensitive operations
+/**
+ * Timing-safe comparison for password hashes
+ * Prevents timing attacks by always comparing in constant time
+ * @param {string} a - First hash
+ * @param {string} b - Second hash
+ * @returns {boolean} True if equal
+ */
+function timingSafeHashCompare(a, b) {
+  // Convert to strings to ensure type safety without early return timing leak
+  const strA = typeof a === 'string' ? a : '';
+  const strB = typeof b === 'string' ? b : '';
+  const typesValid = typeof a === 'string' && typeof b === 'string';
+
+  const bufA = Buffer.from(strA, 'utf8');
+  const bufB = Buffer.from(strB, 'utf8');
+  // Pad shorter buffer to match length for constant-time comparison
+  const maxLen = Math.max(bufA.length, bufB.length, 1); // At least 1 byte
+  const paddedA = Buffer.alloc(maxLen, 0);
+  const paddedB = Buffer.alloc(maxLen, 0);
+  bufA.copy(paddedA);
+  bufB.copy(paddedB);
+  // Always do the comparison to prevent timing attacks
+  const isEqual = crypto.timingSafeEqual(paddedA, paddedB);
+  // Return false if types invalid or lengths differ
+  return typesValid && isEqual && bufA.length === bufB.length;
+}
+
+// Progressive lockout system with persistent state
 const rateLimiter = {
   failedAttempts: 0,
+  lockoutCount: 0,
   lockoutUntil: null,
-  maxAttempts: 5,
-  lockoutDuration: 5 * 60 * 1000, // 5 minutes
+  permanentlyLocked: false,
+  totalFailedAttempts: 0, // Lifetime counter for forensics
 
+  /**
+   * Load lockout state from persistent storage
+   */
+  loadState() {
+    try {
+      if (fs.existsSync(lockoutStatePath)) {
+        const state = JSON.parse(fs.readFileSync(lockoutStatePath, 'utf8'));
+        this.failedAttempts = state.failedAttempts || 0;
+        this.lockoutCount = state.lockoutCount || 0;
+        this.lockoutUntil = state.lockoutUntil || null;
+        this.permanentlyLocked = state.permanentlyLocked || false;
+        this.totalFailedAttempts = state.totalFailedAttempts || 0;
+      }
+    } catch (err) {
+      console.error('[LOCKOUT] Failed to load state:', err.message);
+    }
+  },
+
+  /**
+   * Save lockout state to persistent storage
+   */
+  saveState() {
+    try {
+      const state = {
+        failedAttempts: this.failedAttempts,
+        lockoutCount: this.lockoutCount,
+        lockoutUntil: this.lockoutUntil,
+        permanentlyLocked: this.permanentlyLocked,
+        totalFailedAttempts: this.totalFailedAttempts,
+        updatedAt: new Date().toISOString()
+      };
+      fs.writeFileSync(lockoutStatePath, JSON.stringify(state, null, 2));
+    } catch (err) {
+      console.error('[LOCKOUT] Failed to save state:', err.message);
+    }
+  },
+
+  /**
+   * Check if vault is locked (temporary or permanent)
+   */
   isLocked() {
+    // Permanent lock - requires vault reset
+    if (this.permanentlyLocked) {
+      return true;
+    }
+
+    // Temporary lockout
     if (this.lockoutUntil && Date.now() < this.lockoutUntil) {
       return true;
     }
+
+    // Lockout expired
     if (this.lockoutUntil && Date.now() >= this.lockoutUntil) {
-      // Lockout expired, reset
-      this.reset();
+      this.failedAttempts = 0;
+      this.lockoutUntil = null;
+      this.saveState();
     }
     return false;
   },
 
+  /**
+   * Check if permanently locked
+   */
+  isPermanentlyLocked() {
+    return this.permanentlyLocked;
+  },
+
+  /**
+   * Record a failed authentication attempt
+   */
   recordFailure() {
     this.failedAttempts++;
-    if (this.failedAttempts >= this.maxAttempts) {
-      this.lockoutUntil = Date.now() + this.lockoutDuration;
+    this.totalFailedAttempts++;
+
+    if (this.failedAttempts >= CONFIG.LOCKOUT_MAX_ATTEMPTS) {
+      // Check if we've reached max lockouts - permanent lock
+      if (this.lockoutCount >= CONFIG.LOCKOUT_MAX_LOCKOUTS) {
+        this.permanentlyLocked = true;
+        this.saveState();
+        return;
+      }
+
+      // Get timeout duration from progressive array
+      const timeoutIndex = Math.min(this.lockoutCount, CONFIG.LOCKOUT_TIMEOUTS.length - 1);
+      const lockoutDuration = CONFIG.LOCKOUT_TIMEOUTS[timeoutIndex];
+
+      this.lockoutUntil = Date.now() + lockoutDuration;
+      this.lockoutCount++;
+      this.failedAttempts = 0; // Reset attempt counter for next round
+    }
+
+    this.saveState();
+  },
+
+  /**
+   * Reset lockout state on successful authentication
+   */
+  reset() {
+    this.failedAttempts = 0;
+    this.lockoutCount = 0;
+    this.lockoutUntil = null;
+    // Note: permanentlyLocked and totalFailedAttempts are NOT reset on success
+    // Permanent lock can only be cleared by vault reset
+    this.saveState();
+  },
+
+  /**
+   * Full reset (called during vault reset)
+   */
+  fullReset() {
+    this.failedAttempts = 0;
+    this.lockoutCount = 0;
+    this.lockoutUntil = null;
+    this.permanentlyLocked = false;
+    this.totalFailedAttempts = 0;
+
+    // Delete the lockout state file
+    try {
+      if (fs.existsSync(lockoutStatePath)) {
+        fs.unlinkSync(lockoutStatePath);
+      }
+    } catch (err) {
+      console.error('[LOCKOUT] Failed to delete state file:', err.message);
     }
   },
 
-  reset() {
-    this.failedAttempts = 0;
-    this.lockoutUntil = null;
-  },
-
+  /**
+   * Get remaining lockout time in seconds
+   */
   getRemainingTime() {
+    if (this.permanentlyLocked) return Infinity;
     if (!this.lockoutUntil) return 0;
     const remaining = this.lockoutUntil - Date.now();
     return Math.max(0, Math.ceil(remaining / 1000));
+  },
+
+  /**
+   * Get current lockout level for UI display
+   */
+  getLockoutLevel() {
+    return {
+      currentAttempts: this.failedAttempts,
+      maxAttempts: CONFIG.LOCKOUT_MAX_ATTEMPTS,
+      lockoutCount: this.lockoutCount,
+      maxLockouts: CONFIG.LOCKOUT_MAX_LOCKOUTS,
+      remainingLockouts: CONFIG.LOCKOUT_MAX_LOCKOUTS - this.lockoutCount,
+      permanentlyLocked: this.permanentlyLocked,
+      totalFailedAttempts: this.totalFailedAttempts
+    };
+  },
+
+  /**
+   * Get human-readable next lockout duration
+   */
+  getNextLockoutDuration() {
+    const nextIndex = Math.min(this.lockoutCount, CONFIG.LOCKOUT_TIMEOUTS.length - 1);
+    const durationMs = CONFIG.LOCKOUT_TIMEOUTS[nextIndex];
+    return formatDuration(durationMs);
   }
 };
+
+/**
+ * Format duration in ms to human-readable string
+ */
+function formatDuration(ms) {
+  // Handle edge cases
+  if (!Number.isFinite(ms) || ms < 0) {
+    return 'permanently';
+  }
+
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+
+  if (days > 0) {
+    return days === 1 ? '1 day' : `${days} days`;
+  } else if (hours > 0) {
+    return hours === 1 ? '1 hour' : `${hours} hours`;
+  } else if (minutes > 0) {
+    return minutes === 1 ? '1 minute' : `${minutes} minutes`;
+  } else {
+    return seconds === 1 ? '1 second' : `${seconds} seconds`;
+  }
+}
 
 function createTray() {
   const trayIconPath = path.join(__dirname, 'tray-icon.png');
@@ -323,11 +616,12 @@ ipcMain.handle('app:openExternal', (event, url) => {
   // Validate URL to prevent dangerous protocols
   try {
     const parsedUrl = new URL(url);
+    // Whitelist safe protocols - explicitly block file://, javascript:, data:, etc.
     const allowedProtocols = ['http:', 'https:'];
 
     if (!allowedProtocols.includes(parsedUrl.protocol)) {
-      console.warn('Blocked attempt to open URL with dangerous protocol:', parsedUrl.protocol);
-      return { success: false, error: 'Invalid URL protocol' };
+      console.warn('Blocked attempt to open URL with disallowed protocol:', parsedUrl.protocol);
+      return { success: false, error: 'Only http and https URLs are allowed' };
     }
 
     shell.openExternal(url);
@@ -375,22 +669,31 @@ ipcMain.handle('vault:isInitialized', async () => {
  */
 ipcMain.handle('vault:initialize', async (event, masterPassword) => {
   try {
-    // Accept any password - no validation
+    // Validate password exists
     if (!masterPassword || masterPassword.length === 0) {
       return { success: false, error: 'Password required' };
+    }
+
+    // Prevent DoS via huge passwords causing PBKDF2 slowdown
+    if (masterPassword.length > CONFIG.MAX_PASSWORD_LENGTH) {
+      return { success: false, error: `Password too long (max ${CONFIG.MAX_PASSWORD_LENGTH} characters)` };
     }
 
     // Generate salt for key derivation
     const salt = crypto.randomBytes(encryption.constants.SALT_LENGTH);
 
-    // Hash master password for verification (NOT for encryption)
-    const passwordHash = encryption.hashPassword(masterPassword, salt);
+    // Get current iterations count for storage
+    const iterations = encryption.constants.PBKDF2_ITERATIONS;
 
-    // Store config (salt and password hash)
+    // Hash master password for verification (NOT for encryption)
+    const passwordHash = encryption.hashPassword(masterPassword, salt, iterations);
+
+    // Store config (salt, password hash, and iterations for future compatibility)
     const config = {
       version: '1.0',
       salt: salt.toString('hex'),
       passwordHash,
+      iterations, // Store iterations for backward compatibility
       createdAt: new Date().toISOString()
     };
 
@@ -398,7 +701,7 @@ ipcMain.handle('vault:initialize', async (event, masterPassword) => {
 
     // Create empty encrypted vault
     const emptyVault = {};
-    const { key } = encryption.deriveKey(masterPassword, salt);
+    const { key } = encryption.deriveKey(masterPassword, salt, iterations);
     const { encrypted, iv, tag } = encryption.encrypt(emptyVault, key);
 
     const vaultData = {
@@ -406,7 +709,8 @@ ipcMain.handle('vault:initialize', async (event, masterPassword) => {
       iv,
       tag,
       version: '1.0',
-      algorithm: 'aes-256-gcm'
+      algorithm: 'aes-256-gcm',
+      iterations // Store iterations for backward compatibility
     };
 
     fs.writeFileSync(dataPath, JSON.stringify(vaultData, null, 2));
@@ -422,16 +726,38 @@ ipcMain.handle('vault:initialize', async (event, masterPassword) => {
  */
 ipcMain.handle('vault:unlock', async (event, masterPassword) => {
   try {
-    // Check rate limiting
-    if (rateLimiter.isLocked()) {
-      const remainingSeconds = rateLimiter.getRemainingTime();
-      // Log rate limit trigger
-      auditLog.logRateLimitTriggered(remainingSeconds);
+    // Check for permanent lock first
+    if (rateLimiter.isPermanentlyLocked()) {
+      // Queue event - will be logged after next successful unlock (or lost if vault reset)
+      queueAuditEvent('vault.permanent_lock_attempt', {
+        totalFailedAttempts: rateLimiter.totalFailedAttempts,
+        timestamp: Date.now()
+      }, 'critical');
       return {
         success: false,
-        error: 'Too many failed attempts',
+        error: 'Vault is permanently locked due to too many failed attempts. You must reset the vault to continue.',
+        permanentlyLocked: true,
+        lockoutLevel: rateLimiter.getLockoutLevel()
+      };
+    }
+
+    // Check temporary lockout
+    if (rateLimiter.isLocked()) {
+      const remainingSeconds = rateLimiter.getRemainingTime();
+      const lockoutLevel = rateLimiter.getLockoutLevel();
+      // Queue rate limit event for logging after unlock
+      queueAuditEvent('vault.rate_limit', {
+        remainingSeconds,
+        lockoutCount: rateLimiter.lockoutCount,
+        timestamp: Date.now()
+      }, 'critical');
+      return {
+        success: false,
+        error: `Too many failed attempts. Try again in ${formatDuration(remainingSeconds * 1000)}.`,
         locked: true,
-        remainingSeconds
+        remainingSeconds,
+        lockoutLevel,
+        nextLockoutDuration: rateLimiter.getNextLockoutDuration()
       };
     }
 
@@ -440,21 +766,48 @@ ipcMain.handle('vault:unlock', async (event, masterPassword) => {
       return { success: false, error: 'Vault not initialized' };
     }
 
-    // Load config
-    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-
-    // Verify master password
-    const passwordHash = encryption.hashPassword(masterPassword, config.salt);
-    if (passwordHash !== config.passwordHash) {
-      rateLimiter.recordFailure();
-      // Log failed password attempt
-      auditLog.logFailedUnlock(rateLimiter.failedAttempts);
+    // Prevent DoS via huge passwords causing PBKDF2 slowdown
+    if (masterPassword && masterPassword.length > CONFIG.MAX_PASSWORD_LENGTH) {
       return { success: false, error: 'Invalid master password' };
     }
 
-    // Derive session key
+    // Load config with error handling for corrupted files
+    let config;
+    try {
+      config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    } catch (parseErr) {
+      if (parseErr instanceof SyntaxError) {
+        return { success: false, error: 'Vault configuration is corrupted. Please reset the vault.' };
+      }
+      throw parseErr;
+    }
+
+    // Validate config has required fields
+    if (!config.salt || !config.passwordHash) {
+      return { success: false, error: 'Vault configuration is incomplete. Please reset the vault.' };
+    }
+
+    // Use stored iterations for backward compatibility (default to current if not stored)
+    const storedIterations = config.iterations || encryption.constants.PBKDF2_ITERATIONS;
+
+    // Verify master password (timing-safe comparison)
+    const passwordHash = encryption.hashPassword(masterPassword, config.salt, storedIterations);
+    if (!timingSafeHashCompare(passwordHash, config.passwordHash)) {
+      rateLimiter.recordFailure();
+      // Queue failed attempt for logging after successful unlock
+      queueAuditEvent('vault.unlock.failed', {
+        failedAttempts: rateLimiter.failedAttempts,
+        lockoutCount: rateLimiter.lockoutCount,
+        timestamp: Date.now()
+      }, rateLimiter.failedAttempts >= 5 ? 'critical' : 'warning');
+      // Clear master password from memory on failure
+      clearString(masterPassword);
+      return { success: false, error: 'Invalid master password' };
+    }
+
+    // Derive session key using stored iterations
     const salt = Buffer.from(config.salt, 'hex');
-    const { key } = encryption.deriveKey(masterPassword, salt);
+    const { key } = encryption.deriveKey(masterPassword, salt, storedIterations);
 
     // Store session key securely
     secureSessionKey.set(key);
@@ -462,6 +815,9 @@ ipcMain.handle('vault:unlock', async (event, masterPassword) => {
 
     // Set audit log encryption key
     auditLog.setEncryptionKey(key);
+
+    // Flush any pending audit events (failed attempts, rate limits, etc.)
+    flushPendingAuditEvents();
 
     // Reset rate limiter on successful unlock
     rateLimiter.reset();
@@ -473,13 +829,20 @@ ipcMain.handle('vault:unlock', async (event, masterPassword) => {
     clearString(masterPassword);
 
     return { success: true };
-  } catch (_err) {
+  } catch (err) {
     rateLimiter.recordFailure();
-    // Log failed unlock
-    auditLog.logFailedUnlock(rateLimiter.failedAttempts);
+    // Queue failed unlock for logging after successful unlock
+    queueAuditEvent('vault.unlock.failed', {
+      failedAttempts: rateLimiter.failedAttempts,
+      lockoutCount: rateLimiter.lockoutCount,
+      errorType: err.message?.includes('Decryption') ? 'decryption_error' : 'vault_error',
+      timestamp: Date.now()
+    }, rateLimiter.failedAttempts >= 5 ? 'critical' : 'warning');
     // Clear master password even on failure
     clearString(masterPassword);
-    return { success: false, error: 'Failed to unlock vault' };
+    // Provide more specific error for debugging (without exposing sensitive details)
+    const errorType = err.message?.includes('Decryption') ? 'incorrect password' : 'vault error';
+    return { success: false, error: `Failed to unlock vault: ${errorType}` };
   }
 });
 
@@ -507,6 +870,19 @@ ipcMain.handle('vault:isUnlocked', async () => {
 });
 
 /**
+ * Get current lockout status
+ */
+ipcMain.handle('vault:getLockoutStatus', async () => {
+  return {
+    isLocked: rateLimiter.isLocked(),
+    isPermanentlyLocked: rateLimiter.isPermanentlyLocked(),
+    remainingSeconds: rateLimiter.getRemainingTime(),
+    lockoutLevel: rateLimiter.getLockoutLevel(),
+    nextLockoutDuration: rateLimiter.getNextLockoutDuration()
+  };
+});
+
+/**
  * Completely reset vault (delete all data and config)
  */
 ipcMain.handle('vault:reset', async () => {
@@ -516,16 +892,24 @@ ipcMain.handle('vault:reset', async () => {
     isVaultUnlocked = false;
     auditLog.clearEncryptionKey();
 
-    // Delete vault files
-    if (fs.existsSync(configPath)) {
-      fs.unlinkSync(configPath);
-    }
-    if (fs.existsSync(dataPath)) {
-      fs.unlinkSync(dataPath);
-    }
-    if (fs.existsSync(auditLogPath)) {
-      fs.unlinkSync(auditLogPath);
-    }
+    // Reset lockout state (clears permanent lock)
+    rateLimiter.fullReset();
+
+    // Delete vault files (with error handling for each file)
+    const deleteFile = (filePath) => {
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+        }
+      } catch (unlinkErr) {
+        console.error(`Failed to delete ${filePath}:`, unlinkErr.message);
+        // Continue with other files even if one fails
+      }
+    };
+
+    deleteFile(configPath);
+    deleteFile(dataPath);
+    deleteFile(auditLogPath);
 
     return { success: true };
   } catch (err) {
@@ -552,24 +936,34 @@ ipcMain.handle('vault:changeMasterPassword', async (event, currentPassword, newP
   try {
     // Verify current password
     if (!fs.existsSync(configPath)) {
+      clearString(currentPassword);
+      clearString(newPassword);
       return { success: false, error: 'Vault not initialized' };
     }
 
     const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-    const currentPasswordHash = encryption.hashPassword(currentPassword, config.salt);
 
-    if (currentPasswordHash !== config.passwordHash) {
+    // Use stored iterations for verification (backward compatibility)
+    const oldIterations = config.iterations || encryption.constants.PBKDF2_ITERATIONS;
+    const currentPasswordHash = encryption.hashPassword(currentPassword, config.salt, oldIterations);
+
+    // Timing-safe comparison
+    if (!timingSafeHashCompare(currentPasswordHash, config.passwordHash)) {
+      clearString(currentPassword);
+      clearString(newPassword);
       return { success: false, error: 'Current password is incorrect' };
     }
 
     // Accept any new password - no validation
     if (!newPassword || newPassword.length === 0) {
+      clearString(currentPassword);
+      clearString(newPassword);
       return { success: false, error: 'New password required' };
     }
 
-    // Decrypt vault with old password
+    // Decrypt vault with old password using stored iterations
     const oldSalt = Buffer.from(config.salt, 'hex');
-    const { key: oldKey } = encryption.deriveKey(currentPassword, oldSalt);
+    const { key: oldKey } = encryption.deriveKey(currentPassword, oldSalt, oldIterations);
 
     const encryptedVault = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
     const vaultData = encryption.decrypt(
@@ -579,19 +973,21 @@ ipcMain.handle('vault:changeMasterPassword', async (event, currentPassword, newP
       oldKey
     );
 
-    // Re-encrypt with new password
+    // Re-encrypt with new password using current iterations (upgrade security)
+    const newIterations = encryption.constants.PBKDF2_ITERATIONS;
     const newSalt = crypto.randomBytes(encryption.constants.SALT_LENGTH);
-    const { key: newKey } = encryption.deriveKey(newPassword, newSalt);
+    const { key: newKey } = encryption.deriveKey(newPassword, newSalt, newIterations);
     const { encrypted, iv, tag } = encryption.encrypt(vaultData, newKey);
 
-    // Update config
+    // Update config with new iterations (security upgrade on password change)
     config.salt = newSalt.toString('hex');
-    config.passwordHash = encryption.hashPassword(newPassword, newSalt);
+    config.passwordHash = encryption.hashPassword(newPassword, newSalt, newIterations);
+    config.iterations = newIterations;
     config.updatedAt = new Date().toISOString();
 
-    // Save everything
+    // Save everything with new iterations
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-    fs.writeFileSync(dataPath, JSON.stringify({ data: encrypted, iv, tag, version: '1.0', algorithm: 'aes-256-gcm' }, null, 2));
+    fs.writeFileSync(dataPath, JSON.stringify({ data: encrypted, iv, tag, version: '1.0', algorithm: 'aes-256-gcm', iterations: newIterations }, null, 2));
 
     // Update session key securely
     secureSessionKey.set(newKey);
@@ -649,22 +1045,32 @@ ipcMain.handle('vault:generatePassword', async (event, length = 32, options = {}
  */
 ipcMain.handle('storage:get', async (event, key) => {
   try {
+    // Check for session timeout
+    if (checkSessionKeyRotation()) {
+      return { success: false, error: 'Session expired', locked: true };
+    }
+
     if (!isVaultUnlocked || !secureSessionKey.exists()) {
       return { success: false, error: 'Vault is locked' };
     }
 
-    if (!fs.existsSync(dataPath)) {
-      return { success: true, value: null };
+    // Load and decrypt vault (TOCTOU-safe: use try-catch instead of existsSync)
+    let vaultData = {};
+    try {
+      const encryptedVault = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
+      vaultData = encryption.decrypt(
+        encryptedVault.data,
+        encryptedVault.iv,
+        encryptedVault.tag,
+        secureSessionKey.get()
+      );
+    } catch (readErr) {
+      // File doesn't exist or is unreadable - return null
+      if (readErr.code === 'ENOENT') {
+        return { success: true, value: null };
+      }
+      throw readErr;
     }
-
-    // Load and decrypt vault
-    const encryptedVault = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
-    const vaultData = encryption.decrypt(
-      encryptedVault.data,
-      encryptedVault.iv,
-      encryptedVault.tag,
-      secureSessionKey.get()
-    );
 
     return { success: true, value: vaultData[key] || null };
   } catch (err) {
@@ -677,6 +1083,11 @@ ipcMain.handle('storage:get', async (event, key) => {
  */
 ipcMain.handle('storage:set', async (event, key, value) => {
   try {
+    // Check for session timeout
+    if (checkSessionKeyRotation()) {
+      return { success: false, error: 'Session expired', locked: true };
+    }
+
     // Rate limiting
     const rateLimitResult = storageRateLimiter.tryAcquire('storage:set');
     if (!rateLimitResult.allowed) {
@@ -694,9 +1105,9 @@ ipcMain.handle('storage:set', async (event, key, value) => {
 
     const currentKey = secureSessionKey.get();
 
-    // Load and decrypt current vault
+    // Load and decrypt current vault (TOCTOU-safe)
     let vaultData = {};
-    if (fs.existsSync(dataPath)) {
+    try {
       const encryptedVault = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
       vaultData = encryption.decrypt(
         encryptedVault.data,
@@ -704,6 +1115,11 @@ ipcMain.handle('storage:set', async (event, key, value) => {
         encryptedVault.tag,
         currentKey
       );
+    } catch (readErr) {
+      // File doesn't exist - start with empty vault
+      if (readErr.code !== 'ENOENT') {
+        throw readErr;
+      }
     }
 
     // Update value
@@ -733,22 +1149,31 @@ ipcMain.handle('storage:set', async (event, key, value) => {
  */
 ipcMain.handle('storage:delete', async (event, key) => {
   try {
+    // Check session rotation first
+    if (checkSessionKeyRotation()) {
+      return { success: false, error: 'Session expired - vault locked' };
+    }
     if (!isVaultUnlocked || !secureSessionKey.exists()) {
       return { success: false, error: 'Vault is locked' };
     }
 
-    if (!fs.existsSync(dataPath)) {
-      return { success: true };
+    // Load and decrypt vault (TOCTOU-safe)
+    let vaultData;
+    try {
+      const encryptedVault = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
+      vaultData = encryption.decrypt(
+        encryptedVault.data,
+        encryptedVault.iv,
+        encryptedVault.tag,
+        secureSessionKey.get()
+      );
+    } catch (readErr) {
+      // File doesn't exist - nothing to delete
+      if (readErr.code === 'ENOENT') {
+        return { success: true };
+      }
+      throw readErr;
     }
-
-    // Load and decrypt vault
-    const encryptedVault = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
-    const vaultData = encryption.decrypt(
-      encryptedVault.data,
-      encryptedVault.iv,
-      encryptedVault.tag,
-      secureSessionKey.get()
-    );
 
     // Delete key
     delete vaultData[key];
@@ -851,6 +1276,19 @@ ipcMain.handle('vault:exportBackup', async (event, password) => {
       return { success: false, error: 'Vault is locked' };
     }
 
+    // Check vault file size before export to prevent memory exhaustion
+    try {
+      const stats = fs.statSync(dataPath);
+      if (stats.size > CONFIG.MAX_BACKUP_SIZE) {
+        const maxSizeMB = Math.round(CONFIG.MAX_BACKUP_SIZE / (1024 * 1024));
+        return { success: false, error: `Vault too large to export. Maximum size is ${maxSizeMB} MB.` };
+      }
+    } catch (statErr) {
+      if (statErr.code !== 'ENOENT') {
+        return { success: false, error: 'Failed to check vault size' };
+      }
+    }
+
     // Load current vault data
     const encryptedVault = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
     const vaultData = encryption.decrypt(
@@ -862,11 +1300,18 @@ ipcMain.handle('vault:exportBackup', async (event, password) => {
 
     // Encrypt backup with separate password if provided
     if (password) {
-      const { key, salt } = encryption.deriveKey(password);
+      // Use same iteration count as vault for consistent security
+      const iterations = encryption.constants.PBKDF2_ITERATIONS;
+      const { key, salt } = encryption.deriveKey(password, null, iterations);
       const { encrypted, iv, tag } = encryption.encrypt(vaultData, key);
 
-      // Calculate checksum for integrity verification
-      const checksum = crypto.createHash('sha256').update(encrypted + iv + tag).digest('hex');
+      // Calculate checksum for integrity verification (use consistent buffer-based hashing)
+      const checksumData = Buffer.concat([
+        Buffer.from(encrypted, 'hex'),
+        Buffer.from(iv, 'hex'),
+        Buffer.from(tag, 'hex')
+      ]);
+      const checksum = crypto.createHash('sha256').update(checksumData).digest('hex');
 
       return {
         success: true,
@@ -884,7 +1329,7 @@ ipcMain.handle('vault:exportBackup', async (event, password) => {
       };
     }
 
-    // Return unencrypted backup
+    // Return unencrypted backup (store data as JSON string for consistent checksum)
     const dataString = JSON.stringify(vaultData);
     const checksum = crypto.createHash('sha256').update(dataString).digest('hex');
 
@@ -892,7 +1337,7 @@ ipcMain.handle('vault:exportBackup', async (event, password) => {
       success: true,
       backup: {
         encrypted: false,
-        data: vaultData,
+        data: dataString,  // Store as string to ensure checksum consistency
         version: '1.0',
         checksum,
         createdAt: new Date().toISOString(),
@@ -914,21 +1359,51 @@ ipcMain.handle('vault:importBackup', async (event, backup, password) => {
     }
 
     // Validate backup structure
-    if (!backup || !backup.version) {
-      return { success: false, error: 'Invalid backup file structure' };
+    if (!backup || typeof backup !== 'object') {
+      return { success: false, error: 'Invalid backup: not an object' };
+    }
+    if (!backup.version || typeof backup.version !== 'string') {
+      return { success: false, error: 'Invalid backup: missing or invalid version' };
+    }
+    if (typeof backup.encrypted !== 'boolean') {
+      return { success: false, error: 'Invalid backup: missing encryption flag' };
+    }
+    if (backup.data === undefined || backup.data === null) {
+      return { success: false, error: 'Invalid backup: missing data' };
+    }
+    // Encrypted backups must have iv, tag, and salt
+    if (backup.encrypted) {
+      if (!backup.iv || !backup.tag || !backup.salt) {
+        return { success: false, error: 'Invalid backup: encrypted backup missing required fields (iv, tag, salt)' };
+      }
     }
 
     // Verify checksum if present
     if (backup.checksum) {
       let calculatedChecksum;
       if (backup.encrypted) {
-        calculatedChecksum = crypto.createHash('sha256')
-          .update(backup.data + backup.iv + backup.tag)
-          .digest('hex');
+        // Validate hex format before Buffer.from (must be even-length hex strings)
+        const hexRegex = /^[0-9a-f]+$/i;
+        if (!backup.data || !hexRegex.test(backup.data) || backup.data.length % 2 !== 0) {
+          return { success: false, error: 'Invalid backup: corrupted encrypted data' };
+        }
+        if (!backup.iv || !hexRegex.test(backup.iv) || backup.iv.length !== 32) {
+          return { success: false, error: 'Invalid backup: corrupted IV' };
+        }
+        if (!backup.tag || !hexRegex.test(backup.tag) || backup.tag.length !== 32) {
+          return { success: false, error: 'Invalid backup: corrupted authentication tag' };
+        }
+        // Use buffer-based hashing to match export calculation
+        const checksumData = Buffer.concat([
+          Buffer.from(backup.data, 'hex'),
+          Buffer.from(backup.iv, 'hex'),
+          Buffer.from(backup.tag, 'hex')
+        ]);
+        calculatedChecksum = crypto.createHash('sha256').update(checksumData).digest('hex');
       } else {
-        calculatedChecksum = crypto.createHash('sha256')
-          .update(JSON.stringify(backup.data))
-          .digest('hex');
+        // For unencrypted, data is stored as string
+        const dataString = typeof backup.data === 'string' ? backup.data : JSON.stringify(backup.data);
+        calculatedChecksum = crypto.createHash('sha256').update(dataString).digest('hex');
       }
 
       if (calculatedChecksum !== backup.checksum) {
@@ -963,8 +1438,17 @@ ipcMain.handle('vault:importBackup', async (event, backup, password) => {
         return { success: false, error: 'Failed to decrypt backup. Incorrect password or corrupted data.' };
       }
     } else {
-      // Unencrypted backup
-      importedData = backup.data;
+      // Unencrypted backup (data is stored as JSON string)
+      try {
+        importedData = typeof backup.data === 'string' ? JSON.parse(backup.data) : backup.data;
+      } catch (_parseErr) {
+        return { success: false, error: 'Invalid backup: malformed JSON data' };
+      }
+    }
+
+    // Validate imported data has expected structure
+    if (!importedData || typeof importedData !== 'object') {
+      return { success: false, error: 'Invalid backup: data must be an object' };
     }
 
     // Re-encrypt with current vault key and save
@@ -997,9 +1481,10 @@ ipcMain.handle('vault:setPrivatePassword', async (event, password) => {
   }
 
   try {
-    // Generate salt and hash the private section password
+    // Generate salt and hash the private section password with current iterations
     const privateSalt = crypto.randomBytes(encryption.constants.SALT_LENGTH);
-    const hash = encryption.hashPassword(password, privateSalt);
+    const privateIterations = encryption.constants.PBKDF2_ITERATIONS;
+    const hash = encryption.hashPassword(password, privateSalt, privateIterations);
 
     // Load and decrypt current vault
     let vaultData = {};
@@ -1016,9 +1501,10 @@ ipcMain.handle('vault:setPrivatePassword', async (event, password) => {
     // Get current data or create new structure
     const currentData = vaultData['eterna-v2'] ? JSON.parse(vaultData['eterna-v2']) : {};
 
-    // Store the hash and salt in the data
+    // Store the hash, salt, and iterations in the data
     currentData.privatePasswordHash = hash;
     currentData.privatePasswordSalt = privateSalt.toString('hex');
+    currentData.privatePasswordIterations = privateIterations;
 
     // Update vault data
     vaultData['eterna-v2'] = JSON.stringify(currentData);
@@ -1036,8 +1522,11 @@ ipcMain.handle('vault:setPrivatePassword', async (event, password) => {
 
     fs.writeFileSync(dataPath, JSON.stringify(encryptedVaultData, null, 2));
 
+    // Clear password from memory
+    clearString(password);
     return { success: true };
   } catch (err) {
+    clearString(password);
     return { success: false, error: 'Failed to set private password', details: err.message };
   }
 });
@@ -1080,14 +1569,28 @@ ipcMain.handle('vault:unlockPrivate', async (event, password) => {
       return { success: false, error: 'Private section not set up' };
     }
 
-    // Hash the provided password with stored salt and compare
-    const hash = encryption.hashPassword(password, currentData.privatePasswordSalt);
-    if (hash === currentData.privatePasswordHash) {
+    // Validate salt format before use
+    if (!/^[0-9a-f]{64}$/i.test(currentData.privatePasswordSalt)) {
+      // Log corruption to audit for forensics
+      auditLog.log('security.corruption_detected', {
+        component: 'privatePasswordSalt',
+        timestamp: Date.now()
+      }, 'critical');
+      return { success: false, error: 'Corrupted private password data' };
+    }
+
+    // Hash the provided password with stored salt and iterations (timing-safe comparison)
+    const storedIterations = currentData.privatePasswordIterations ?? encryption.constants.PBKDF2_ITERATIONS;
+    const hash = encryption.hashPassword(password, currentData.privatePasswordSalt, storedIterations);
+    if (timingSafeHashCompare(hash, currentData.privatePasswordHash)) {
       // Reset rate limiter on success
       privateUnlockRateLimiter.reset('private-unlock');
+      clearString(password);
       return { success: true };
     }
 
+    // Failed attempt already counted by tryAcquire at handler start
+    clearString(password);
     return { success: false, error: 'Incorrect password' };
   } catch (err) {
     return { success: false, error: 'Failed to unlock private section', details: err.message };
@@ -1118,8 +1621,10 @@ ipcMain.handle('vault:resetPrivate', async (_event) => {
     // Get current data
     const currentData = vaultData['eterna-v2'] ? JSON.parse(vaultData['eterna-v2']) : {};
 
-    // Remove private password hash
+    // Remove all private password data for complete cleanup
     delete currentData.privatePasswordHash;
+    delete currentData.privatePasswordSalt;
+    delete currentData.privatePasswordIterations;
 
     // Update vault data
     vaultData['eterna-v2'] = JSON.stringify(currentData);
@@ -1232,7 +1737,7 @@ function verifyCodeIntegrity() {
     } else {
       // First run - store hashes
       fs.writeFileSync(integrityPath, JSON.stringify(currentHashes, null, 2));
-      console.log('[INTEGRITY] Baseline file hashes stored');
+      // Baseline file hashes stored silently on first run
     }
   } catch (err) {
     console.error('[INTEGRITY] Failed to verify code integrity:', err);
@@ -1241,6 +1746,9 @@ function verifyCodeIntegrity() {
 
 // ============ APP LIFECYCLE ============
 app.whenReady().then(() => {
+  // Load persistent lockout state
+  rateLimiter.loadState();
+
   // Verify code integrity on startup
   verifyCodeIntegrity();
 
